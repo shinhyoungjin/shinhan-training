@@ -26,8 +26,8 @@ def init_db():
         )
     ''')
     
-    # 기존 테이블과 구조 충돌 방지를 위해 구 버전 테이블 삭제 후 신규 생성
-    c.execute("DROP TABLE IF EXISTS watch_logs")
+    # 시청 기록 테이블 (기존 테이블 초기화 및 새로 생성)
+    c.execute("DROP TABLE IF EXISTS watch_records")
     c.execute('''
         CREATE TABLE IF NOT EXISTS watch_records (
             registration_number TEXT PRIMARY KEY,
@@ -71,7 +71,7 @@ def get_user_record(reg_num):
         conn.close()
     return {"total_sec": 0, "first_start": None, "is_completed": 0}
 
-# 실시간 시청 시간 갱신 (Auto-save)
+# 실시간 시청 시간 갱신 (Auto-save) - REPLACE INTO 구문으로 변경
 def update_user_watched_time(reg_num, name, email, add_seconds, target_seconds):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     record = get_user_record(reg_num)
@@ -82,16 +82,16 @@ def update_user_watched_time(reg_num, name, email, add_seconds, target_seconds):
 
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
-    c.execute('''
-        INSERT INTO watch_records (registration_number, name, email, total_watched_seconds, first_start_time, last_update_time, is_completed)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(registration_number) DO UPDATE SET
-            total_watched_seconds = ?,
-            last_update_time = ?,
-            is_completed = ?
-    ''', (reg_num, name, email, new_total_sec, first_start, now_str, is_completed, new_total_sec, now_str, is_completed))
-    conn.commit()
-    conn.close()
+    try:
+        c.execute('''
+            REPLACE INTO watch_records (registration_number, name, email, total_watched_seconds, first_start_time, last_update_time, is_completed)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (reg_num, name, email, new_total_sec, first_start, now_str, is_completed))
+        conn.commit()
+    except Exception as e:
+        st.error(f"저장 오류: {e}")
+    finally:
+        conn.close()
     return new_total_sec, is_completed
 
 # --- 3. 구글 시트 데이터 가져오기 ---
