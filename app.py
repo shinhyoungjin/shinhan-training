@@ -26,8 +26,7 @@ def init_db():
         )
     ''')
     
-    # 시청 기록 테이블 (기존 테이블 초기화 및 새로 생성)
-    c.execute("DROP TABLE IF EXISTS watch_records")
+    # 시청 기록 테이블
     c.execute('''
         CREATE TABLE IF NOT EXISTS watch_records (
             registration_number TEXT PRIMARY KEY,
@@ -71,12 +70,10 @@ def get_user_record(reg_num):
         conn.close()
     return {"total_sec": 0, "first_start": None, "is_completed": 0}
 
-# 실시간 시청 시간 갱신 (Auto-save) - REPLACE INTO 구문으로 변경
-def update_user_watched_time(reg_num, name, email, add_seconds, target_seconds):
+# DB 시청 시간 저장 함수
+def save_user_watched_time(reg_num, name, email, new_total_sec, target_seconds):
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     record = get_user_record(reg_num)
-    
-    new_total_sec = record["total_sec"] + add_seconds
     first_start = record["first_start"] if record["first_start"] else now_str
     is_completed = 1 if new_total_sec >= target_seconds else 0
 
@@ -92,7 +89,6 @@ def update_user_watched_time(reg_num, name, email, add_seconds, target_seconds):
         st.error(f"저장 오류: {e}")
     finally:
         conn.close()
-    return new_total_sec, is_completed
 
 # --- 3. 구글 시트 데이터 가져오기 ---
 @st.cache_data(ttl=600)
@@ -117,10 +113,12 @@ def get_users_from_google_sheet():
 # --- 4. 세션 상태 초기화 ---
 if 'is_playing' not in st.session_state:
     st.session_state.is_playing = False
-if 'last_autosave_time' not in st.session_state:
-    st.session_state.last_autosave_time = time.time()
+if 'current_user_sec' not in st.session_state:
+    st.session_state.current_user_sec = 0
 if 'selected_reg_num' not in st.session_state:
     st.session_state.selected_reg_num = None
+if 'last_db_save' not in st.session_state:
+    st.session_state.last_db_save = time.time()
 
 settings = get_settings()
 target_seconds = settings["target_min"] * 60
@@ -149,10 +147,12 @@ if not users_df.empty:
     if selected_user_str != "선택하세요":
         reg_num = selected_user_str.split('등록번호: ')[1].split(')')[0]
         
+        # 수강자가 바뀌었을 때 DB에서 기존 기록 불러오기
         if st.session_state.selected_reg_num != reg_num:
             st.session_state.selected_reg_num = reg_num
             st.session_state.is_playing = False
-            st.session_state.last_autosave_time = time.time()
+            user_rec = get_user_record(reg_num)
+            st.session_state.current_user_sec = user_rec["total_sec"]
             
         current_user = users_df[users_df['registration_number'] == reg_num].iloc[0]
         st.sidebar.success(f"확인됨: **{current_user['name']}** 님")
@@ -208,9 +208,6 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
-    user_record = get_user_record(current_user['registration_number'])
-    total_watched_sec = user_record["total_sec"]
-
     st.subheader(f"📌 교육 영상 (목표 시청시간: {settings['target_min']}분)")
     st.video(settings["url"])
     
@@ -222,20 +219,31 @@ else:
         if not st.session_state.is_playing:
             if st.button("▶️ 영상 시청 시작 / 재개", use_container_width=True):
                 st.session_state.is_playing = True
-                st.session_state.last_autosave_time = time.time()
+                st.session_state.last_db_save = time.time()
                 st.rerun()
         else:
-            if st.button("⏸️ 일시 정지", use_container_width=True):
+            if st.button("⏸️ 일시 정지 및 DB 저장", use_container_width=True):
                 st.session_state.is_playing = False
+                # 일시정지 시 DB 즉시 저장
+                save_user_watched_time(
+                    current_user['registration_number'],
+                    current_user['name'],
+                    current_user['email'],
+                    st.session_state.current_user_sec,
+                    target_seconds
+                )
+                st.success("시청 기록이 DB에 저장되었습니다.")
                 st.rerun()
 
+        # 현재 초 카운트 표시
+        total_watched_sec = st.session_state.current_user_sec
         progress = min(total_watched_sec / target_seconds, 1.0)
         st.progress(progress)
         
         current_min = total_watched_sec // 60
         current_sec = total_watched_sec % 60
         st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-        st.caption("🔒 시청 기록은 10초마다 DB에 실시간으로 자동 저장됩니다.")
+        st.caption("🔒 시청 시간은 매초 카운트되며 5초마다 DB에 자동 저장됩니다.")
 
     with col2:
         st.markdown("### 📝 이수 상태")
@@ -246,16 +254,21 @@ else:
             remaining_sec = target_seconds - total_watched_sec
             st.info(f"목표 시간까지 **{remaining_sec // 60}분 {remaining_sec % 60}초** 남았습니다.")
 
+    # [핵심] 실시간 1초 카운터 및 5초 주기 DB 저장 루프
     if st.session_state.is_playing:
         time.sleep(1)
+        st.session_state.current_user_sec += 1
+        
+        # 5초마다 DB에 자동 저장
         now = time.time()
-        if now - st.session_state.last_autosave_time >= 10:
-            update_user_watched_time(
+        if now - st.session_state.last_db_save >= 5:
+            save_user_watched_time(
                 current_user['registration_number'],
                 current_user['name'],
                 current_user['email'],
-                10,
+                st.session_state.current_user_sec,
                 target_seconds
             )
-            st.session_state.last_autosave_time = now
+            st.session_state.last_db_save = now
+            
         st.rerun()
