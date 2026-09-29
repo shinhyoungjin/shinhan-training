@@ -65,20 +65,31 @@ def get_user_total_seconds(reg_num):
     conn.close()
     return result if result is not None else 0
 
-# 세션 단위 시청 기록 저장/업데이트 (단일 행 업데이트 방식)
+# 특정 수강자의 세부 시청 이력 목록 조회
+def get_user_logs(reg_num):
+    conn = sqlite3.connect('training_data.db')
+    query = """
+        SELECT session_start_time, session_end_time, session_seconds 
+        FROM watch_logs 
+        WHERE registration_number = ? 
+        ORDER BY id DESC
+    """
+    df = pd.read_sql(query, conn, params=(reg_num,))
+    conn.close()
+    return df
+
+# 세션 단위 시청 기록 저장/업데이트
 def upsert_watch_session(log_id, reg_num, name, email, start_time, end_time, session_sec):
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
     
     if log_id is None:
-        # 접속 후 첫 저장 시: 새 세션 행 생성
         c.execute('''
             INSERT INTO watch_logs (registration_number, name, email, session_start_time, session_end_time, session_seconds)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (reg_num, name, email, start_time, end_time, session_sec))
         new_id = c.lastrowid
     else:
-        # 기존 접속 유지 중일 때: 동일 행의 종료시간 및 시청시간만 업데이트
         c.execute('''
             UPDATE watch_logs 
             SET session_end_time = ?, session_seconds = ?
@@ -187,7 +198,6 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
         conn.close()
         
         if not logs_df.empty:
-            # 1) 인별 누적 요약 집계표
             summary_df = logs_df.groupby(['registration_number', 'name', 'email']).agg(
                 총_시청_초=('session_seconds', 'sum'),
                 시청_횟수=('id', 'count'),
@@ -214,7 +224,6 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
                 mime='text/csv'
             )
 
-            # 2) 세션별 개별 시청 로그
             logs_export = logs_df.rename(columns={
                 'id': '로그ID',
                 'registration_number': '등록번호',
@@ -241,10 +250,8 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
-    # 이전 접속 기록들에서 누적된 총 시간 + 이번 세션 시청 시간
     db_watched_sec = get_user_total_seconds(current_user['registration_number'])
     
-    # 현재 재생 중인 세션이 DB에 이미 등록되어 있다면 해당 초는 중복 합산되지 않도록 처리
     if st.session_state.current_log_id is not None:
         conn = sqlite3.connect('training_data.db')
         c = conn.cursor()
@@ -309,13 +316,29 @@ else:
             remaining_sec = target_seconds - total_watched_sec
             st.info(f"목표 시간까지 **{remaining_sec // 60}분 {remaining_sec % 60}초** 남았습니다.")
 
-    # 1초 카운터 및 동일 세션 행(UPDATE) 실시간 자동 저장
+    # --- [신규 추가] 수강자 전용 개인 시청 이력 및 대시보드 영역 ---
+    st.markdown("---")
+    st.subheader(f"📊 [{current_user['name']} 님]의 개인 교육 이수 현황")
+    
+    user_logs_df = get_user_logs(current_user['registration_number'])
+    
+    if not user_logs_df.empty:
+        user_logs_df['시청 시간'] = user_logs_df['session_seconds'].apply(lambda x: f"{x // 60}분 {x % 60}초")
+        user_logs_df = user_logs_df.rename(columns={
+            'session_start_time': '시청 시작 시각',
+            'session_end_time': '시청 종료/저장 시각'
+        })[['시청 시작 시각', '시청 종료/저장 시각', '시청 시간']]
+        
+        st.dataframe(user_logs_df, use_container_width=True)
+    else:
+        st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
+
+    # 1초 카운터 및 자동 저장 루프
     if st.session_state.is_playing:
         time.sleep(1)
         st.session_state.current_session_sec += 1
         
         now = time.time()
-        # 5초 주기로 동일 세션 로그 행의 종료시간 및 총 초 수 업데이트
         if now - st.session_state.last_autosave_time >= 5:
             end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             log_id = upsert_watch_session(
