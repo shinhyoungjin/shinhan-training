@@ -26,7 +26,8 @@ def init_db():
         )
     ''')
     
-    # 인별 시청 누적 기록 테이블
+    # 기존 테이블과 구조 충돌 방지를 위해 구 버전 테이블 삭제 후 신규 생성
+    c.execute("DROP TABLE IF EXISTS watch_logs")
     c.execute('''
         CREATE TABLE IF NOT EXISTS watch_records (
             registration_number TEXT PRIMARY KEY,
@@ -60,11 +61,14 @@ def get_settings():
 def get_user_record(reg_num):
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
-    c.execute("SELECT total_watched_seconds, first_start_time, is_completed FROM watch_records WHERE registration_number = ?", (reg_num,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {"total_sec": row[0], "first_start": row[1], "is_completed": row[2]}
+    try:
+        c.execute("SELECT total_watched_seconds, first_start_time, is_completed FROM watch_records WHERE registration_number = ?", (reg_num,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return {"total_sec": row[0], "first_start": row[1], "is_completed": row[2]}
+    except Exception:
+        conn.close()
     return {"total_sec": 0, "first_start": None, "is_completed": 0}
 
 # 실시간 시청 시간 갱신 (Auto-save)
@@ -182,7 +186,6 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
             records_df['총_시청_시간'] = records_df['total_watched_seconds'].apply(lambda x: f"{x // 60}분 {x % 60}초")
             records_df['이수_완료_여부'] = records_df['is_completed'].apply(lambda x: '완료' if x == 1 else '미완료(진행중)')
             
-            # 보기 편한 컬럼명 재정의
             export_df = records_df.rename(columns={
                 'registration_number': '등록번호',
                 'name': '성명',
@@ -205,7 +208,6 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
-    # 현재 DB에 반영된 사용자의 실시간 기록
     user_record = get_user_record(current_user['registration_number'])
     total_watched_sec = user_record["total_sec"]
 
@@ -227,7 +229,6 @@ else:
                 st.session_state.is_playing = False
                 st.rerun()
 
-        # 진척도
         progress = min(total_watched_sec / target_seconds, 1.0)
         st.progress(progress)
         
@@ -245,11 +246,9 @@ else:
             remaining_sec = target_seconds - total_watched_sec
             st.info(f"목표 시간까지 **{remaining_sec // 60}분 {remaining_sec % 60}초** 남았습니다.")
 
-    # 실시간 타이머 및 10초 주기 자동 저장 루프
     if st.session_state.is_playing:
         time.sleep(1)
         now = time.time()
-        # 재생 시작 후 10초가 지날 때마다 DB에 저장
         if now - st.session_state.last_autosave_time >= 10:
             update_user_watched_time(
                 current_user['registration_number'],
