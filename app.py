@@ -2,7 +2,13 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
+import pytz
 import time
+
+# --- 한국 시간대(KST) 설정 함수 ---
+def get_kst_now_str():
+    kst = pytz.timezone('Asia/Seoul')
+    return datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
 
 # --- 1. 페이지 기본 설정 ---
 st.set_page_config(
@@ -78,7 +84,7 @@ def get_user_logs(reg_num):
     conn.close()
     return df
 
-# 세션 단위 시청 기록 저장/업데이트
+# 세션 단위 시청 기록 저장/업데이트 (한국 표준시 적용)
 def upsert_watch_session(log_id, reg_num, name, email, start_time, end_time, session_sec):
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
@@ -140,7 +146,7 @@ target_seconds = settings["target_min"] * 60
 
 # --- 5. 메인 UI ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
-st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료")
+st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (한국 표준시 KST 기준)")
 
 # 사이드바
 st.sidebar.header("👤 수강자 확인")
@@ -220,7 +226,7 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
             st.download_button(
                 label="📥 1. 인별 총 시청 집계표 (요약) 다운로드",
                 data=csv_summary,
-                file_name=f"교육이수_요약집계표_{datetime.now().strftime('%Y%m%d')}.csv",
+                file_name=f"교육이수_요약집계표_{get_kst_now_str()[:10].replace('-','')}.csv",
                 mime='text/csv'
             )
 
@@ -229,18 +235,18 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
                 'registration_number': '등록번호',
                 'name': '성명',
                 'email': '이메일',
-                'session_start_time': '시청시작시각',
-                'session_end_time': '최종시청/저장시각',
+                'session_start_time': '시청시작시각(KST)',
+                'session_end_time': '최종시청/저장시각(KST)',
                 'session_seconds': '해당세션_시청초'
             })
             logs_export['해당세션_시청시간'] = logs_export['해당세션_시청초'].apply(lambda x: f"{x // 60}분 {x % 60}초")
-            logs_export = logs_export[['로그ID', '등록번호', '성명', '이메일', '시청시작시각', '최종시청/저장시각', '해당세션_시청시간']]
+            logs_export = logs_export[['로그ID', '등록번호', '성명', '이메일', '시청시작시각(KST)', '최종시청/저장시각(KST)', '해당세션_시청시간']]
 
             csv_logs = logs_export.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label="📥 2. 개별 시청 상세 이력 로그 다운로드",
                 data=csv_logs,
-                file_name=f"개별_시청상세로그_{datetime.now().strftime('%Y%m%d')}.csv",
+                file_name=f"개별_시청상세로그_{get_kst_now_str()[:10].replace('-','')}.csv",
                 mime='text/csv'
             )
         else:
@@ -275,14 +281,14 @@ else:
             if st.button("▶️ 영상 시청 시작 / 재개", use_container_width=True):
                 st.session_state.is_playing = True
                 st.session_state.last_autosave_time = time.time()
-                st.session_state.session_start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                st.session_state.session_start_str = get_kst_now_str()
                 st.session_state.current_log_id = None
                 st.session_state.current_session_sec = 0
                 st.rerun()
         else:
             if st.button("⏸️ 일시 정지 및 DB 저장", use_container_width=True):
                 if st.session_state.current_session_sec > 0:
-                    end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    end_str = get_kst_now_str()
                     upsert_watch_session(
                         st.session_state.current_log_id,
                         current_user['registration_number'],
@@ -305,7 +311,7 @@ else:
         current_min = total_watched_sec // 60
         current_sec = total_watched_sec % 60
         st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-        st.caption("🔒 시청 시간은 실시간 자동 저장되며, 접속 회차별로 깔끔하게 기록됩니다.")
+        st.caption("🔒 시청 시간은 실시간 자동 저장되며, 한국 표준시(KST)로 기록됩니다.")
 
     with col2:
         st.markdown("### 📝 이수 상태")
@@ -316,7 +322,7 @@ else:
             remaining_sec = target_seconds - total_watched_sec
             st.info(f"목표 시간까지 **{remaining_sec // 60}분 {remaining_sec % 60}초** 남았습니다.")
 
-    # --- [신규 추가] 수강자 전용 개인 시청 이력 및 대시보드 영역 ---
+    # 수강자 전용 개인 시청 이력 영역
     st.markdown("---")
     st.subheader(f"📊 [{current_user['name']} 님]의 개인 교육 이수 현황")
     
@@ -325,22 +331,22 @@ else:
     if not user_logs_df.empty:
         user_logs_df['시청 시간'] = user_logs_df['session_seconds'].apply(lambda x: f"{x // 60}분 {x % 60}초")
         user_logs_df = user_logs_df.rename(columns={
-            'session_start_time': '시청 시작 시각',
-            'session_end_time': '시청 종료/저장 시각'
-        })[['시청 시작 시각', '시청 종료/저장 시각', '시청 시간']]
+            'session_start_time': '시청 시작 시각 (KST)',
+            'session_end_time': '시청 종료/저장 시각 (KST)'
+        })[['시청 시작 시각 (KST)', '시청 종료/저장 시각 (KST)', '시청 시간']]
         
         st.dataframe(user_logs_df, use_container_width=True)
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
-    # 1초 카운터 및 자동 저장 루프
+    # 1초 카운터 및 KST 시간 기반 5초 주기 자동 저장
     if st.session_state.is_playing:
         time.sleep(1)
         st.session_state.current_session_sec += 1
         
         now = time.time()
         if now - st.session_state.last_autosave_time >= 5:
-            end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            end_str = get_kst_now_str()
             log_id = upsert_watch_session(
                 st.session_state.current_log_id,
                 current_user['registration_number'],
