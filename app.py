@@ -15,7 +15,8 @@ st.set_page_config(
 def init_db():
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
-    # 교육 영상 정보 테이블
+    
+    # 교육 영상 및 목표 시간 설정 테이블
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             id INTEGER PRIMARY KEY,
@@ -24,20 +25,20 @@ def init_db():
             admin_password TEXT
         )
     ''')
-    # 시청 기록 테이블
+    
+    # 시청 세션 세부 로그 테이블 (중간 시청 내역 기록)
     c.execute('''
-        CREATE TABLE IF NOT EXISTS watch_records (
+        CREATE TABLE IF NOT EXISTS watch_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             registration_number TEXT,
             name TEXT,
             email TEXT,
-            start_time TEXT,
-            end_time TEXT,
-            watched_seconds INTEGER,
-            is_completed INTEGER
+            session_start_time TEXT,
+            session_end_time TEXT,
+            session_seconds INTEGER
         )
     ''')
-    
+
     # 기본 영상 세팅 (최초 실행 시)
     c.execute("SELECT COUNT(*) FROM settings")
     if c.fetchone()[0] == 0:
@@ -48,7 +49,7 @@ def init_db():
 
 init_db()
 
-# DB 읽기/저장 함수들
+# DB 조작 함수들
 def get_settings():
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
@@ -57,28 +58,38 @@ def get_settings():
     conn.close()
     return {"url": row[0], "target_min": row[1], "password": row[2]}
 
-def save_record(reg_num, name, email, start_time, end_time, watched_sec, is_completed):
+# 특정 수강자의 기존 총 누적 시청 시간(초 단위) 조회
+def get_user_total_watched_seconds(reg_num):
+    conn = sqlite3.connect('training_data.db')
+    c = conn.cursor()
+    c.execute("SELECT SUM(session_seconds) FROM watch_logs WHERE registration_number = ?", (reg_num,))
+    result = c.fetchone()[0]
+    conn.close()
+    return result if result is not None else 0
+
+# 시청 세션 저장 함수 (일시정지, 완료, 차시별 기록)
+def save_watch_session(reg_num, name, email, start_time, end_time, session_sec):
+    if session_sec <= 0:
+        return
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
     c.execute('''
-        INSERT INTO watch_records (registration_number, name, email, start_time, end_time, watched_seconds, is_completed)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (reg_num, name, email, start_time, end_time, watched_sec, 1 if is_completed else 0))
+        INSERT INTO watch_logs (registration_number, name, email, session_start_time, session_end_time, session_seconds)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (reg_num, name, email, start_time, end_time, session_sec))
     conn.commit()
     conn.close()
 
-# --- 3. 구글 시트 데이터 실시간 불러오기 (10분 주기 캐싱) ---
+# --- 3. 구글 시트 수강생 명단 실시간 연동 (10분 캐싱) ---
 @st.cache_data(ttl=600)
 def get_users_from_google_sheet():
     sheet_url = "https://docs.google.com/spreadsheets/d/1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0"
     try:
         df = pd.read_csv(sheet_url)
-        # 성명, 등록번호, rsm 메일 컬럼 추출 및 정리
         df['등록번호'] = df['등록번호'].fillna('').astype(str).str.replace('.0', '', regex=False)
         df['성명'] = df['성명'].fillna('')
         df['rsm 메일'] = df['rsm 메일'].fillna('')
         
-        # 내부 표준 컬럼명으로 변경
         df = df.rename(columns={
             '등록번호': 'registration_number',
             '성명': 'name',
@@ -89,27 +100,28 @@ def get_users_from_google_sheet():
         st.error(f"구글 시트를 불러오는 중 오류가 발생했습니다: {e}")
         return pd.DataFrame(columns=['registration_number', 'name', 'email'])
 
-# --- 4. 세션 상태 관리 ---
+# --- 4. 세션 상태 초기화 ---
 if 'is_playing' not in st.session_state:
     st.session_state.is_playing = False
-if 'watched_seconds' not in st.session_state:
-    st.session_state.watched_seconds = 0
-if 'start_time' not in st.session_state:
-    st.session_state.start_time = None
+if 'current_session_seconds' not in st.session_state:
+    st.session_state.current_session_seconds = 0
+if 'session_start_time' not in st.session_state:
+    st.session_state.session_start_time = None
+if 'selected_reg_num' not in st.session_state:
+    st.session_state.selected_reg_num = None
 
 settings = get_settings()
 target_seconds = settings["target_min"] * 60
 
-# --- 5. 메인 화면 구성 ---
+# --- 5. UI 구성 ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
-st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 완료 처리")
+st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 완료 처리 (분할 시청 가능)")
 
-# 사이드바 (수강자 식별 & 관리자 로그인)
+# 사이드바: 수강자 식별
 st.sidebar.header("👤 수강자 확인")
-
-# 구글 시트에서 명단 불러오기
 users_df = get_users_from_google_sheet()
 
+current_user = None
 if not users_df.empty:
     user_options = [
         f"{row['name']} (등록번호: {row['registration_number']}) - {row['email']}" 
@@ -122,10 +134,16 @@ if not users_df.empty:
         options=["선택하세요"] + user_options
     )
 
-    current_user = None
     if selected_user_str != "선택하세요":
-        # 선택된 문자열에서 등록번호 파싱
         reg_num = selected_user_str.split('등록번호: ')[1].split(')')[0]
+        
+        # 수강자가 변경된 경우 기존 시청 상태 리셋
+        if st.session_state.selected_reg_num != reg_num:
+            st.session_state.selected_reg_num = reg_num
+            st.session_state.is_playing = False
+            st.session_state.current_session_seconds = 0
+            st.session_state.session_start_time = None
+            
         current_user = users_df[users_df['registration_number'] == reg_num].iloc[0]
         st.sidebar.success(f"확인됨: **{current_user['name']}** 님")
 else:
@@ -151,17 +169,39 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
             st.success("저장되었습니다!")
             st.rerun()
 
-        st.subheader("2. 시청 기록 다운로드")
+        st.subheader("2. 시청 기록 다운로드 (통합 증빙용)")
         conn = sqlite3.connect('training_data.db')
-        records_df = pd.read_sql("SELECT * FROM watch_records", conn)
+        logs_df = pd.read_sql("SELECT * FROM watch_logs", conn)
         conn.close()
         
-        if not records_df.empty:
-            csv = records_df.to_csv(index=False).encode('utf-8-sig')
+        if not logs_df.empty:
+            # 인별 총 누적 시간 및 완료 여부 집계
+            summary_df = logs_df.groupby(['registration_number', 'name', 'email']).agg(
+                총_시청_초=('session_seconds', 'sum'),
+                시청_횟수=('id', 'count'),
+                최초_시청일시=('session_start_time', 'min'),
+                최종_시청일시=('session_end_time', 'max')
+            ).reset_index()
+
+            summary_df['총_시청_시간'] = summary_df['총_시청_초'].apply(lambda x: f"{x // 60}분 {x % 60}초")
+            summary_df['이수_완료_여부'] = summary_df['총_시청_초'].apply(
+                lambda x: '완료' if x >= settings['target_min'] * 60 else '미완료(진행중)'
+            )
+
+            # 증빙용 CSV 생성
+            csv_summary = summary_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 시청 기록 (CSV/엑셀) 다운로드",
-                data=csv,
-                file_name=f"시청기록_{datetime.now().strftime('%Y%m%d')}.csv",
+                label="📥 인별 총 시청 집계표 (요약) 다운로드",
+                data=csv_summary,
+                file_name=f"교육이수_집계표_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime='text/csv'
+            )
+            
+            csv_logs = logs_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 상세 접속/시청 로그 전체 다운로드",
+                data=csv_logs,
+                file_name=f"상세시청로그_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime='text/csv'
             )
         else:
@@ -171,9 +211,11 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
+    # 기존 DB에 저장된 누적 시청 시간 조회
+    previous_watched_sec = get_user_total_watched_seconds(current_user['registration_number'])
+    total_watched_sec = previous_watched_sec + st.session_state.current_session_seconds
+
     st.subheader(f"📌 교육 영상 (목표 시청시간: {settings['target_min']}분)")
-    
-    # 유튜브 플레이어 표시
     st.video(settings["url"])
     
     col1, col2 = st.columns([1, 2])
@@ -181,52 +223,68 @@ else:
     with col1:
         st.markdown("### ⏱️ 시청 시간 측정")
         
-        # 타이머 조작 버튼
+        # 재생/일시정지 버튼 조작
         if not st.session_state.is_playing:
             if st.button("▶️ 영상 시청 시작 / 재개", use_container_width=True):
                 st.session_state.is_playing = True
-                if st.session_state.start_time is None:
-                    st.session_state.start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                st.session_state.session_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 st.rerun()
         else:
-            if st.button("⏸️ 일시 정지", use_container_width=True):
-                st.session_state.is_playing = False
-                st.rerun()
-
-        # 진척도 및 누적 시간
-        progress = min(st.session_state.watched_seconds / target_seconds, 1.0)
-        st.progress(progress)
-        
-        current_min = st.session_state.watched_seconds // 60
-        current_sec = st.session_state.watched_seconds % 60
-        st.metric("누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-
-    with col2:
-        st.markdown("### 📝 이수 제출")
-        if st.session_state.watched_seconds >= target_seconds:
-            st.success("🎉 필수 시청 시간을 모두 충족했습니다!")
-            if st.button("✅ 시청 완료 기록 제출하기", type="primary", use_container_width=True):
+            if st.button("⏸️ 일시 정지 및 시청 기록 저장", use_container_width=True):
+                # 일시 정지 시 현재 세션 기록을 DB에 중간 저장
                 end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                save_record(
+                save_watch_session(
                     current_user['registration_number'],
                     current_user['name'],
                     current_user['email'],
-                    st.session_state.start_time,
+                    st.session_state.session_start_time,
                     end_time,
-                    st.session_state.watched_seconds,
-                    True
+                    st.session_state.current_session_seconds
                 )
-                st.balloons()
-                st.success("시청 완료 기록이 성공적으로 DB에 저장되었습니다.")
-                # 상태 초기화
-                st.session_state.watched_seconds = 0
                 st.session_state.is_playing = False
-                st.session_state.start_time = None
-        else:
-            st.info(f"목표 시간({settings['target_min']}분)을 채우시면 제출 버튼이 활성화됩니다.")
+                st.session_state.current_session_seconds = 0
+                st.session_state.session_start_time = None
+                st.success("중간 시청 기록이 DB에 안전하게 저장되었습니다.")
+                st.rerun()
 
-    # 타이머 실시간 카운트 루프 (시청 중일 때)
+        # 진척도 계산
+        progress = min(total_watched_sec / target_seconds, 1.0)
+        st.progress(progress)
+        
+        current_min = total_watched_sec // 60
+        current_sec = total_watched_sec % 60
+        st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
+        
+        if previous_watched_sec > 0:
+            st.caption(f"💡 기존 누적 시청 기록: {previous_watched_sec // 60}분 {previous_watched_sec % 60}초")
+
+    with col2:
+        st.markdown("### 📝 이수 완료 상태")
+        if total_watched_sec >= target_seconds:
+            st.success("🎉 필수 시청 시간을 모두 충족했습니다!")
+            
+            # 이수 완료 시 세션 자동 저장 및 제출 안내
+            if st.session_state.is_playing:
+                end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                save_watch_session(
+                    current_user['registration_number'],
+                    current_user['name'],
+                    current_user['email'],
+                    st.session_state.session_start_time,
+                    end_time,
+                    st.session_state.current_session_seconds
+                )
+                st.session_state.is_playing = False
+                st.session_state.current_session_seconds = 0
+                st.balloons()
+            
+            st.info("이수가 성공적으로 완료되어 인증기관 제출용 DB에 누적 기록되었습니다.")
+        else:
+            remaining_sec = target_seconds - total_watched_sec
+            st.info(f"목표 시간까지 **{remaining_sec // 60}분 {remaining_sec % 60}초** 남았습니다. 나누어 시청하셔도 됩니다.")
+
+    # 실시간 카운터 (시청 중일 때)
     if st.session_state.is_playing:
         time.sleep(1)
-        st.session_state.watched_seconds += 1
+        st.session_state.current_session_seconds += 1
         st.rerun()
