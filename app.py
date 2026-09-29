@@ -15,14 +15,6 @@ st.set_page_config(
 def init_db():
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
-    # 수강생 명단 테이블
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            registration_number TEXT PRIMARY KEY,
-            name TEXT,
-            email TEXT
-        )
-    ''')
     # 교육 영상 정보 테이블
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
@@ -46,16 +38,7 @@ def init_db():
         )
     ''')
     
-    # 기본 데이터 세팅 (최초 실행 시)
-    c.execute("SELECT COUNT(*) FROM users")
-    if c.fetchone()[0] == 0:
-        default_users = [
-            ('1001', '홍길동', 'gildong@shinhan.com'),
-            ('1002', '김철수', 'chulsoo@shinhan.com'),
-            ('1003', '이영희', 'younghee@shinhan.com')
-        ]
-        c.executemany("INSERT INTO users VALUES (?, ?, ?)", default_users)
-        
+    # 기본 영상 세팅 (최초 실행 시)
     c.execute("SELECT COUNT(*) FROM settings")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO settings VALUES (1, 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', 50, 'admin1234')")
@@ -65,7 +48,7 @@ def init_db():
 
 init_db()
 
-# DB 읽기 함수들
+# DB 읽기/저장 함수들
 def get_settings():
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
@@ -73,12 +56,6 @@ def get_settings():
     row = c.fetchone()
     conn.close()
     return {"url": row[0], "target_min": row[1], "password": row[2]}
-
-def get_users():
-    conn = sqlite3.connect('training_data.db')
-    df = pd.read_sql("SELECT * FROM users", conn)
-    conn.close()
-    return df
 
 def save_record(reg_num, name, email, start_time, end_time, watched_sec, is_completed):
     conn = sqlite3.connect('training_data.db')
@@ -90,7 +67,29 @@ def save_record(reg_num, name, email, start_time, end_time, watched_sec, is_comp
     conn.commit()
     conn.close()
 
-# --- 3. 세션 상태 관리 ---
+# --- 3. 구글 시트 데이터 실시간 불러오기 (10분 주기 캐싱) ---
+@st.cache_data(ttl=600)
+def get_users_from_google_sheet():
+    sheet_url = "https://docs.google.com/spreadsheets/d/1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0"
+    try:
+        df = pd.read_csv(sheet_url)
+        # 성명, 등록번호, rsm 메일 컬럼 추출 및 정리
+        df['등록번호'] = df['등록번호'].fillna('').astype(str).str.replace('.0', '', regex=False)
+        df['성명'] = df['성명'].fillna('')
+        df['rsm 메일'] = df['rsm 메일'].fillna('')
+        
+        # 내부 표준 컬럼명으로 변경
+        df = df.rename(columns={
+            '등록번호': 'registration_number',
+            '성명': 'name',
+            'rsm 메일': 'email'
+        })
+        return df[['registration_number', 'name', 'email']]
+    except Exception as e:
+        st.error(f"구글 시트를 불러오는 중 오류가 발생했습니다: {e}")
+        return pd.DataFrame(columns=['registration_number', 'name', 'email'])
+
+# --- 4. 세션 상태 관리 ---
 if 'is_playing' not in st.session_state:
     st.session_state.is_playing = False
 if 'watched_seconds' not in st.session_state:
@@ -101,43 +100,55 @@ if 'start_time' not in st.session_state:
 settings = get_settings()
 target_seconds = settings["target_min"] * 60
 
-# --- 4. 메인 화면 구성 ---
+# --- 5. 메인 화면 구성 ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
 st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 완료 처리")
 
-# 사이드바 (수강생 식별 & 관리자 로그인)
+# 사이드바 (수강자 식별 & 관리자 로그인)
 st.sidebar.header("👤 수강자 확인")
-users_df = get_users()
-user_options = [f"{row['name']} ({row['registration_number']}) - {row['email']}" for _, row in users_df.iterrows()]
 
-selected_user_str = st.sidebar.selectbox(
-    "본인의 이름을 검색하여 선택하세요 (오탈자 방지)",
-    options=["선택하세요"] + user_options
-)
+# 구글 시트에서 명단 불러오기
+users_df = get_users_from_google_sheet()
 
-current_user = None
-if selected_user_str != "선택하세요":
-    reg_num = selected_user_str.split('(')[1].split(')')[0]
-    current_user = users_df[users_df['registration_number'] == reg_num].iloc[0]
-    st.sidebar.success(f"확인됨: **{current_user['name']}** 님")
+if not users_df.empty:
+    user_options = [
+        f"{row['name']} (등록번호: {row['registration_number']}) - {row['email']}" 
+        for _, row in users_df.iterrows()
+        if row['name'] != ''
+    ]
+    
+    selected_user_str = st.sidebar.selectbox(
+        "본인의 이름을 검색하여 선택하세요 (오탈자 방지)",
+        options=["선택하세요"] + user_options
+    )
+
+    current_user = None
+    if selected_user_str != "선택하세요":
+        # 선택된 문자열에서 등록번호 파싱
+        reg_num = selected_user_str.split('등록번호: ')[1].split(')')[0]
+        current_user = users_df[users_df['registration_number'] == reg_num].iloc[0]
+        st.sidebar.success(f"확인됨: **{current_user['name']}** 님")
+else:
+    st.sidebar.error("수강자 명단을 불러오지 못했습니다. 구글 시트 공유 설정을 확인해 주세요.")
 
 st.sidebar.markdown("---")
-# 관리자 섹션
+
+# 관리자 메뉴
 with st.sidebar.expander("⚙️ 관리자 메뉴"):
     admin_pw = st.text_input("관리자 비밀번호", type="password")
     if admin_pw == settings["password"]:
         st.success("관리자 인증 성공")
         
-        st.subheader("1. 교육 영상 교체")
+        st.subheader("1. 교육 영상 및 시간 교체")
         new_url = st.text_input("유튜브 영상 URL", value=settings["url"])
         new_target = st.number_input("목표 시청시간(분)", value=settings["target_min"], min_value=1)
-        if st.button("영상/시간 설정 저장"):
+        if st.button("설정 저장"):
             conn = sqlite3.connect('training_data.db')
             c = conn.cursor()
             c.execute("UPDATE settings SET video_url = ?, target_minutes = ? WHERE id = 1", (new_url, new_target))
             conn.commit()
             conn.close()
-            st.success("저장되었습니다! 페이지를 새로고침하세요.")
+            st.success("저장되었습니다!")
             st.rerun()
 
         st.subheader("2. 시청 기록 다운로드")
@@ -156,7 +167,7 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
         else:
             st.info("아직 저장된 시청 기록이 없습니다.")
 
-# --- 5. 교육 시청 메인 영역 ---
+# --- 6. 교육 시청 메인 영역 ---
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
