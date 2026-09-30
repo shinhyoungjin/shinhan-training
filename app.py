@@ -25,21 +25,21 @@ def get_gspread_client():
                 scopes=scopes
             )
             return gspread.authorize(creds)
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"❌ GCP 서비스 계정 인증 중 예외 발생: {e}")
     return None
 
-# 구글 시트에 실시간 로그 백업 전송 (에러 원인 출력 버전)
+# 구글 시트에 실시간 로그 백업 전송 (상세 에러 진단 기능 포함)
 def backup_to_google_sheet(reg_num, name, email, start_time, end_time, session_sec):
     try:
         client = get_gspread_client()
         if client is None:
-            st.error("❌ 구글 서비스 계정 인증 실패: Secrets의 [gcp_service_account] 설정을 확인하세요.")
-            return
+            st.error("❌ 구글 서비스 계정 인증 실패: Streamlit Secrets의 [gcp_service_account] 설정을 확인하세요.")
+            return False
             
         if "backup_sheet_url" not in st.secrets:
             st.error("❌ Secrets에 'backup_sheet_url' 설정이 누락되었습니다.")
-            return
+            return False
 
         # 백업 시트 열기
         spreadsheet = client.open_by_url(st.secrets["backup_sheet_url"])
@@ -49,10 +49,13 @@ def backup_to_google_sheet(reg_num, name, email, start_time, end_time, session_s
         row = [reg_num, name, email, start_time, end_time, session_sec, time_str]
         
         sheet.append_row(row)
-        st.success("✅ 구글 스프레드시트에 성공적으로 백업 기록이 전송되었습니다!")
+        st.success("✅ 구글 스프레드시트에 안전하게 백업 기록이 전송되었습니다!")
+        return True
         
     except Exception as e:
         st.error(f"❌ 구글 백업 중 상세 에러 발생: {e}")
+        return False
+
 # --- 1. 페이지 기본 설정 ---
 st.set_page_config(
     page_title="법인 임직원 온라인 교육 시스템",
@@ -162,7 +165,7 @@ def get_users_from_google_sheet():
         })
         return df[['registration_number', 'name', 'email']]
     except Exception as e:
-        st.error(f"구글 시트를 불러오는 중 오류가 발생했습니다: {e}")
+        st.error(f"구글 명단 시트를 불러오는 중 오류가 발생했습니다: {e}")
         return pd.DataFrame(columns=['registration_number', 'name', 'email'])
 
 # --- 4. 세션 상태 초기화 ---
@@ -294,6 +297,21 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
+    # --- [진단용 임시 버튼] 구글 시트 연동 즉시 확인 ---
+    with st.expander("🧪 [개발자 진단용] 구글 시트 연동 테스트 클릭", expanded=True):
+        st.caption("아래 버튼을 클릭하여 Secrets 및 구글 API 연동 상태를 실시간 진단할 수 있습니다.")
+        if st.button("🧪 구글 시트 연동 즉시 테스트"):
+            test_start = get_kst_now_str()
+            test_end = get_kst_now_str()
+            backup_to_google_sheet(
+                current_user['registration_number'],
+                current_user['name'],
+                current_user['email'],
+                test_start,
+                test_end,
+                10
+            )
+
     db_watched_sec = get_user_total_seconds(current_user['registration_number'])
     
     if st.session_state.current_log_id is not None:
@@ -327,6 +345,8 @@ else:
             if st.button("⏸️ 일시 정지 및 DB 저장", use_container_width=True):
                 if st.session_state.current_session_sec > 0:
                     end_str = get_kst_now_str()
+                    
+                    # 1. 로컬 DB 저장
                     upsert_watch_session(
                         st.session_state.current_log_id,
                         current_user['registration_number'],
@@ -336,7 +356,8 @@ else:
                         end_str,
                         st.session_state.current_session_sec
                     )
-                    # 구글 드라이브/시트에 실시간 백업 전송
+                    
+                    # 2. 구글 드라이브/시트 실시간 백업 전송
                     backup_to_google_sheet(
                         current_user['registration_number'],
                         current_user['name'],
@@ -345,11 +366,11 @@ else:
                         end_str,
                         st.session_state.current_session_sec
                     )
+
                 st.session_state.is_playing = False
                 st.session_state.current_session_sec = 0
                 st.session_state.current_log_id = None
                 st.session_state.session_start_str = None
-                st.success("시청 기록이 로컬 및 구글 드라이브에 안전하게 보관되었습니다.")
                 st.rerun()
 
         progress = min(total_watched_sec / target_seconds, 1.0)
@@ -386,7 +407,7 @@ else:
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
-    # 1초 카운터 및 5초 주기 저장 & 구글 백업 루프
+    # 1초 카운터 및 5초 주기 자동 저장
     if st.session_state.is_playing:
         time.sleep(1)
         st.session_state.current_session_sec += 1
