@@ -31,23 +31,15 @@ def get_gspread_client():
     return None
 
 # ==========================================================
-# 개선된 구글 시트 이관(Sync) 기능
-# Streamlit 로컬 SQLite DB의 실제 저장된 기록을 읽어 구글 시트로 이관
+# 완벽 동기화: SQLite DB의 watch_logs 기록을 구글 시트로 1:1 이관
 # ==========================================================
 def sync_db_log_to_google_sheet(log_id, target_minutes, is_final_save=False):
     """
-    로컬 DB의 watch_logs 테이블에서 해당 log_id의 실제 저장을 확인한 후
-    구글 시트에 동기화하여 수치 불일치 및 창 닫힘 오차를 방지합니다.
+    SQLite DB의 watch_logs 테이블에서 해당 log_id의 '실제 저장이 완료된 데이터'를 읽어
+    구글 시트에 즉시 동기화합니다. (DB 저장치 = 구글 시트 반영치 100% 일치)
     """
-    now = time.time()
-    last_saved = st.session_state.get("last_gsheet_save_time", 0)
-
-    # 정지(완료)가 아닌 자동 동기화 시 30초 간격 제한 (구글 API 쿼터 보호)
-    if not is_final_save and (now - last_saved < 30) and ("gsheet_row_num" in st.session_state):
-        return True
-
     try:
-        # 1. DB에서 최신 시청 이력 1건 조회
+        # 1. 로컬 DB에서 실제로 저장된 데이터 조회 (Single Source of Truth)
         conn = sqlite3.connect('training_data.db')
         c = conn.cursor()
         c.execute("""
@@ -70,7 +62,7 @@ def sync_db_log_to_google_sheet(log_id, target_minutes, is_final_save=False):
         spreadsheet = client.open_by_url(st.secrets["backup_sheet_url"])
         sheet = spreadsheet.sheet1
         
-        # 2. 헤더(열 제목)가 없다면 최초 생성
+        # 2. 헤더(열 제목)가 없다면 생성
         all_values = sheet.get_all_values()
         if len(all_values) == 0:
             header = [
@@ -85,9 +77,8 @@ def sync_db_log_to_google_sheet(log_id, target_minutes, is_final_save=False):
         session_time_str = f"{session_sec // 60}분 {session_sec % 60}초"
         status_str = "시청 완료 (정지)" if is_final_save else "시청 중 (자동저장)"
 
-        # 3. 구글 시트 행 추가 또는 업데이트
+        # 3. 구글 시트에 행 추가 또는 덮어쓰기 업데이트
         if "gsheet_row_num" not in st.session_state:
-            # 세션 ID 생성
             session_id = st.session_state.get("current_session_id")
             if not session_id:
                 session_id = f"SESS_{reg_num}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
@@ -101,19 +92,16 @@ def sync_db_log_to_google_sheet(log_id, target_minutes, is_final_save=False):
             
             all_values = sheet.get_all_values()
             st.session_state["gsheet_row_num"] = len(all_values)
-            st.session_state["last_gsheet_save_time"] = now
             return True
 
-        # 이미 생성된 행 위치로 업데이트
+        # 이미 세션 행이 지정되어 있는 경우 -> DB와 완전히 동일한 값으로 덮어쓰기
         row_num = st.session_state["gsheet_row_num"]
         
-        sheet.update_cell(row_num, 2, log_id_val)          # 2열: 로그ID
-        sheet.update_cell(row_num, 7, end_time)            # 7열: 최종시청/저장시각(KST)
-        sheet.update_cell(row_num, 8, session_time_str)    # 8열: 해당세션_시청시간
-        sheet.update_cell(row_num, 9, session_sec)         # 9열: 해당세션_시청초
-        sheet.update_cell(row_num, 10, status_str)         # 10열: 상태
-        
-        st.session_state["last_gsheet_save_time"] = now
+        # 구글 시트 특정 셀 범위 일괄 업데이트 (네트워크 오버헤드 최소화)
+        sheet.update(
+            f"B{row_num}:J{row_num}",
+            [[log_id_val, reg_num, name, email, start_time, end_time, session_time_str, session_sec, status_str]]
+        )
         return True
 
     except Exception as e:
@@ -251,7 +239,7 @@ target_seconds = settings["target_min"] * 60
 
 # --- 5. 메인 UI ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
-st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (로컬 DB 기반 구글 시트 이관 백업 연동)")
+st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (SQLite DB 기반 구글 시트 실시간 이관 연동)")
 
 # 사이드바
 st.sidebar.header("👤 수강자 확인")
@@ -395,7 +383,6 @@ else:
                 st.session_state.current_log_id = None
                 st.session_state.current_session_sec = 0
                 
-                # 새로 시작 시 구글 시트 행 추적 번호 초기화
                 if "gsheet_row_num" in st.session_state:
                     del st.session_state["gsheet_row_num"]
                 if "current_session_id" in st.session_state:
@@ -406,7 +393,7 @@ else:
                 if st.session_state.current_session_sec > 0:
                     end_str = get_kst_now_str()
                     
-                    # 1. 로컬 SQLite DB 저장 (Single Source of Truth)
+                    # 1. 로컬 SQLite DB 저장
                     log_id = upsert_watch_session(
                         st.session_state.current_log_id,
                         current_user['registration_number'],
@@ -417,7 +404,7 @@ else:
                         st.session_state.current_session_sec
                     )
                     
-                    # 2. 저장 완료된 DB 데이터를 읽어서 구글 시트로 최종 이관
+                    # 2. DB 저장 완료된 데이터를 구글 시트로 최종 즉시 이관
                     sync_db_log_to_google_sheet(
                         log_id,
                         settings['target_min'],
@@ -440,7 +427,7 @@ else:
         current_min = total_watched_sec // 60
         current_sec = total_watched_sec % 60
         st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-        st.caption("🔒 시청 기록은 SQLite DB 저장을 거쳐 구글 드라이브에 실시간으로 오차 없이 동기화됩니다.")
+        st.caption("🔒 로컬 SQLite DB에 실시간 저장된 시청 기록이 구글 드라이브 시트로 1:1 완벽하게 이관됩니다.")
 
     with col2:
         st.markdown("### 📝 이수 상태")
@@ -468,7 +455,7 @@ else:
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
-    # 1초 타이머 + 5초 로컬 DB 자동 업데이트 + 30초 구글 백업 이관
+    # 타이머 및 즉시 동기화 파이프라인
     if st.session_state.is_playing:
         time.sleep(1)
         st.session_state.current_session_sec += 1
@@ -476,8 +463,9 @@ else:
         now = time.time()
         end_str = get_kst_now_str()
         
-        # 1. [5초마다] 로컬 SQLite DB 저장 (우선 반영)
+        # 5초마다 SQLite DB 저장 후 완료되면 구글 시트로 즉시 이관
         if now - st.session_state.last_autosave_time >= 5:
+            # Step 1: SQLite DB 저장 (Singular Truth Data 생성)
             log_id = upsert_watch_session(
                 st.session_state.current_log_id,
                 current_user['registration_number'],
@@ -490,7 +478,7 @@ else:
             st.session_state.current_log_id = log_id
             st.session_state.last_autosave_time = now
 
-            # 2. [DB에 저장 완료된 log_id가 있을 때] 30초 간격으로 DB 기록을 구글 시트로 이관
+            # Step 2: DB 저장이 확정된 log_id 데이터를 읽어 구글 시트로 즉시 동기화
             sync_db_log_to_google_sheet(
                 log_id,
                 settings['target_min'],
