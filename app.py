@@ -30,18 +30,19 @@ def get_gspread_client():
         st.error(f"❌ GCP 서비스 계정 인증 중 예외 발생: {e}")
     return None
 
-# ================= =========================================
-# 개선된 구글 시트 백업 기능 (방식 A: 접속 세션별 1행 생성 & 30초 주기 갱신)
-# ================= =========================================
-def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, session_sec, is_final_save=False):
+# ==========================================================
+# 개선된 구글 시트 백업 기능 (열 구성 명확화 & 종료시각 버그 수정)
+# ==========================================================
+def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, session_sec, total_watched_sec, is_final_save=False):
     """
-    1차/2차 등 새로 접속할 때마다 별도의 세션 행(Row)을 추가하고,
-    동일 세션 안에서는 30초마다 해당 행의 시청 시간만 덮어씌워 갱신합니다.
+    구글 시트에 세션별로 기록합니다.
+    [1열: 세션ID, 2열: 등록번호, 3열: 성명, 4열: 이메일, 5열: 시청 시작 시각, 
+     6열: 시청 종료/저장 시각, 7열: 이번 세션 시청시간, 8열: 총 누적 시청시간, 9열: 이수 상태]
     """
     now = time.time()
     last_saved = st.session_state.get("last_gsheet_save_time", 0)
 
-    # 수동 일시정지(is_final_save)가 아니면 30초 간격 제한 적용
+    # 수동 일시정지가 아니면 30초 간격 제한 적용 (구글 API 쿼터 보호)
     if not is_final_save and (now - last_saved < 30) and ("gsheet_row_num" in st.session_state):
         return True
 
@@ -52,13 +53,30 @@ def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, s
 
         spreadsheet = client.open_by_url(st.secrets["backup_sheet_url"])
         sheet = spreadsheet.sheet1
-        time_str = f"{session_sec // 60}분 {session_sec % 60}초"
-        status_str = "시청 완료" if is_final_save else "시청 중 (자동저장)"
+        
+        # 시트가 아예 비어있을 경우 헤더(열 제목) 생성
+        all_values = sheet.get_all_values()
+        if len(all_values) == 0:
+            header = [
+                "세션 ID", "등록번호", "성명", "이메일", 
+                "시청 시작 시각 (KST)", "시청 종료/저장 시각 (KST)", 
+                "이번 세션 시청시간", "총 누적 시청시간", "상태"
+            ]
+            sheet.append_row(header)
+            all_values = sheet.get_all_values()
+
+        # 시청 시간 포맷팅
+        session_time_str = f"{session_sec // 60}분 {session_sec % 60}초"
+        total_time_str = f"{total_watched_sec // 60}분 {total_watched_sec % 60}초"
+        status_str = "시청 완료 (정지)" if is_final_save else "시청 중 (자동저장)"
 
         # ① 최초 1회만 새로운 줄 생성 (새 세션 ID 발급)
         if "gsheet_row_num" not in st.session_state:
             session_id = f"{reg_num}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
-            new_row = [session_id, reg_num, name, email, start_time, end_time, session_sec, time_str, status_str]
+            new_row = [
+                session_id, reg_num, name, email, 
+                start_time, end_time, session_time_str, total_time_str, status_str
+            ]
             sheet.append_row(new_row)
             
             all_values = sheet.get_all_values()
@@ -66,12 +84,14 @@ def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, s
             st.session_state["last_gsheet_save_time"] = now
             return True
 
-        # ② 기존 생성된 세션 행이 존재할 경우 해당 줄만 덮어쓰기 (기존 1차 시청 기록 보존)
+        # ② 기존 세션 행이 이미 생성되어 있는 경우 -> 해당 행 값들 업데이트
         row_num = st.session_state["gsheet_row_num"]
-        sheet.update_cell(row_num, 5, end_time)     # 5번째 열: 종료/저장 시각
-        sheet.update_cell(row_num, 6, session_sec)  # 6번째 열: 시청 초
-        sheet.update_cell(row_num, 7, time_str)     # 7번째 열: 포맷팅된 시청 시간
-        sheet.update_cell(row_num, 9, status_str)   # 9번째 열: 이수/시청 상태
+        
+        # 셀 개별 덮어쓰기 (5열~9열)
+        sheet.update_cell(row_num, 6, end_time)          # 6열: 시청 종료/저장 시각
+        sheet.update_cell(row_num, 7, session_time_str)  # 7열: 이번 세션 시청시간
+        sheet.update_cell(row_num, 8, total_time_str)    # 8열: 총 누적 시청시간
+        sheet.update_cell(row_num, 9, status_str)        # 9열: 상태
         
         st.session_state["last_gsheet_save_time"] = now
         return True
@@ -380,6 +400,7 @@ else:
                         st.session_state.session_start_str,
                         end_str,
                         st.session_state.current_session_sec,
+                        total_watched_sec,
                         is_final_save=True
                     )
 
@@ -447,7 +468,7 @@ else:
             st.session_state.current_log_id = log_id
             st.session_state.last_autosave_time = now
 
-        # 구글 백업 시트에 30초 간격으로 현재 세션 행에만 시청 시간 덮어쓰기
+        # 구글 백업 시트에 30초 간격으로 현재 세션 행에만 덮어쓰기
         backup_to_google_sheet_session(
             current_user['registration_number'],
             current_user['name'],
@@ -455,6 +476,7 @@ else:
             st.session_state.session_start_str,
             end_str,
             st.session_state.current_session_sec,
+            total_watched_sec,
             is_final_save=False
         )
 
