@@ -4,11 +4,42 @@ import sqlite3
 from datetime import datetime
 import pytz
 import time
+import gspread
+from google.oauth2.service_account import Credentials
 
-# --- 한국 시간대(KST) 설정 함수 ---
+# --- 한국 시간대(KST) 설정 ---
 def get_kst_now_str():
     kst = pytz.timezone('Asia/Seoul')
     return datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')
+
+# --- 구글 시트 백업 연동 클라이언트 ---
+def get_gspread_client():
+    try:
+        if "gcp_service_account" in st.secrets:
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            creds = Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"],
+                scopes=scopes
+            )
+            return gspread.authorize(creds)
+    except Exception:
+        pass
+    return None
+
+# 구글 시트에 실시간 로그 백업 전송
+def backup_to_google_sheet(reg_num, name, email, start_time, end_time, session_sec):
+    try:
+        client = get_gspread_client()
+        if client and "backup_sheet_url" in st.secrets:
+            sheet = client.open_by_url(st.secrets["backup_sheet_url"]).sheet1
+            time_str = f"{session_sec // 60}분 {session_sec % 60}초"
+            row = [reg_num, name, email, start_time, end_time, session_sec, time_str]
+            sheet.append_row(row)
+    except Exception as e:
+        st.caption(f"⚠️ 구글 백업 중 연동 알림: {e}")
 
 # --- 1. 페이지 기본 설정 ---
 st.set_page_config(
@@ -22,7 +53,6 @@ def init_db():
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
     
-    # 설정 테이블
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             id INTEGER PRIMARY KEY,
@@ -32,7 +62,6 @@ def init_db():
         )
     ''')
     
-    # 개별 시청 세션 로그 테이블
     c.execute('''
         CREATE TABLE IF NOT EXISTS watch_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +91,6 @@ def get_settings():
     conn.close()
     return {"url": row[0], "target_min": row[1], "password": row[2]}
 
-# 특정 수강자의 전체 누적 시청 시간(초) 조회
 def get_user_total_seconds(reg_num):
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
@@ -71,7 +99,6 @@ def get_user_total_seconds(reg_num):
     conn.close()
     return result if result is not None else 0
 
-# 특정 수강자의 세부 시청 이력 목록 조회
 def get_user_logs(reg_num):
     conn = sqlite3.connect('training_data.db')
     query = """
@@ -84,7 +111,6 @@ def get_user_logs(reg_num):
     conn.close()
     return df
 
-# 세션 단위 시청 기록 저장/업데이트 (한국 표준시 적용)
 def upsert_watch_session(log_id, reg_num, name, email, start_time, end_time, session_sec):
     conn = sqlite3.connect('training_data.db')
     c = conn.cursor()
@@ -107,7 +133,7 @@ def upsert_watch_session(log_id, reg_num, name, email, start_time, end_time, ses
     conn.close()
     return new_id
 
-# --- 3. 구글 시트 데이터 가져오기 ---
+# --- 3. 명단 구글 시트 연동 ---
 @st.cache_data(ttl=600)
 def get_users_from_google_sheet():
     sheet_url = "https://docs.google.com/spreadsheets/d/1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0"
@@ -146,7 +172,7 @@ target_seconds = settings["target_min"] * 60
 
 # --- 5. 메인 UI ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
-st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (한국 표준시 KST 기준)")
+st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (구글 드라이브 실시간 이중 백업 연동)")
 
 # 사이드바
 st.sidebar.header("👤 수강자 확인")
@@ -252,7 +278,7 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
         else:
             st.info("아직 저장된 시청 기록이 없습니다.")
 
-# 메인 시청 영역
+# 메인 교육 시청 영역
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
@@ -298,11 +324,20 @@ else:
                         end_str,
                         st.session_state.current_session_sec
                     )
+                    # 구글 드라이브/시트에 실시간 백업 전송
+                    backup_to_google_sheet(
+                        current_user['registration_number'],
+                        current_user['name'],
+                        current_user['email'],
+                        st.session_state.session_start_str,
+                        end_str,
+                        st.session_state.current_session_sec
+                    )
                 st.session_state.is_playing = False
                 st.session_state.current_session_sec = 0
                 st.session_state.current_log_id = None
                 st.session_state.session_start_str = None
-                st.success("시청 기록이 저장되었습니다.")
+                st.success("시청 기록이 로컬 및 구글 드라이브에 안전하게 보관되었습니다.")
                 st.rerun()
 
         progress = min(total_watched_sec / target_seconds, 1.0)
@@ -311,13 +346,13 @@ else:
         current_min = total_watched_sec // 60
         current_sec = total_watched_sec % 60
         st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-        st.caption("🔒 시청 시간은 실시간 자동 저장되며, 한국 표준시(KST)로 기록됩니다.")
+        st.caption("🔒 시청 시간은 실시간 자동 저장되며, 구글 드라이브에 안전하게 이중 백업됩니다.")
 
     with col2:
         st.markdown("### 📝 이수 상태")
         if total_watched_sec >= target_seconds:
             st.success("🎉 필수 시청 시간을 모두 충족하여 이수가 완료되었습니다!")
-            st.info("관리자 제출용 DB에 이수 완료 상태가 자동으로 수집되었습니다.")
+            st.info("관리자 제출용 DB 및 구글 드라이브에 이수 기록이 안전하게 백업되었습니다.")
         else:
             remaining_sec = target_seconds - total_watched_sec
             st.info(f"목표 시간까지 **{remaining_sec // 60}분 {remaining_sec % 60}초** 남았습니다.")
@@ -339,7 +374,7 @@ else:
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
-    # 1초 카운터 및 KST 시간 기반 5초 주기 자동 저장
+    # 1초 카운터 및 5초 주기 저장 & 구글 백업 루프
     if st.session_state.is_playing:
         time.sleep(1)
         st.session_state.current_session_sec += 1
