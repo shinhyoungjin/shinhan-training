@@ -1,5 +1,6 @@
 import hmac
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from google.oauth2.service_account import Credentials
 DB_PATH = "training_data.db"
 DB_SAVE_INTERVAL = 5          # DB 자동저장(=하트비트) 주기(초)
 SHEET_SYNC_INTERVAL = 60      # 구글 시트 동기화 주기(초)
+RECONCILE_INTERVAL = 30       # 비정상 종료 세션을 시트에 반영하는 백그라운드 점검 주기(초)
 HEARTBEAT_TIMEOUT = 20        # 이 시간 이상 하트비트가 없으면 '죽은 세션'으로 간주(초)
 
 SHEET_HEADER = [
@@ -90,6 +92,9 @@ def init_db():
             conn.execute("ALTER TABLE watch_logs ADD COLUMN last_heartbeat REAL DEFAULT 0")
         if "is_active" not in cols:
             conn.execute("ALTER TABLE watch_logs ADD COLUMN is_active INTEGER DEFAULT 0")
+        if "synced_seconds" not in cols:
+            # 시트에 마지막으로 반영된 시청초 (NULL = 아직 한 번도 반영 안 됨)
+            conn.execute("ALTER TABLE watch_logs ADD COLUMN synced_seconds INTEGER")
 
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_watch_logs_uuid ON watch_logs(session_uuid)"
@@ -145,9 +150,15 @@ def get_sheet():
     return sheet
 
 
-def sync_to_sheet(session_uuid, is_final=False):
-    """DB에 저장된 세션 값을 읽어 시트에 반영합니다. (세션ID로 행을 찾아 덮어쓰기)"""
-    try:
+@st.cache_resource
+def get_sync_lock():
+    """시트 동기화(화면 세션 + 백그라운드 점검)가 동시에 같은 행을 append 하지 않도록 하는 잠금"""
+    return threading.Lock()
+
+
+def _push_session_to_sheet(session_uuid, status):
+    """DB의 세션 값을 시트에 반영하고, 반영한 시청초를 DB(synced_seconds)에 기록합니다."""
+    with get_sync_lock():
         with db() as conn:
             row = conn.execute(
                 """
@@ -161,7 +172,6 @@ def sync_to_sheet(session_uuid, is_final=False):
             return False
 
         log_id, reg, name, email, start, end, sec = row
-        status = "시청 완료 (정지)" if is_final else "시청 중 (자동저장)"
         values = [session_uuid, log_id, reg, name, email, start, end,
                   fmt_sec(sec), sec, status]
 
@@ -172,13 +182,78 @@ def sync_to_sheet(session_uuid, is_final=False):
         else:
             sheet.append_row(values, value_input_option="RAW")
 
-        st.session_state.last_sync_ok = True
+        with db() as conn:
+            conn.execute(
+                "UPDATE watch_logs SET synced_seconds = ? WHERE session_uuid = ?",
+                (sec, session_uuid),
+            )
         return True
+
+
+def sync_to_sheet(session_uuid, is_final=False):
+    """화면 세션에서 호출: 실패해도 앱은 계속 동작하고, 상태만 기록합니다."""
+    try:
+        status = "시청 완료 (정지)" if is_final else "시청 중 (자동저장)"
+        ok = _push_session_to_sheet(session_uuid, status)
+        st.session_state.last_sync_ok = bool(ok)
+        return ok
     except Exception as e:
         st.session_state.last_sync_ok = False
         print(f"구글 시트 동기화 실패: {e}")
         get_sheet.clear()  # 다음 시도에서 재연결
         return False
+
+
+def reconcile_unsynced():
+    """
+    시트에 아직 반영되지 않은 세션을 찾아 반영합니다. (창을 닫거나 정지 시 동기화가 실패한 경우)
+    - 정상 종료(is_active=0)인데 미반영 → '시청 완료 (정지)'
+    - 하트비트가 끊긴 활성 세션(창 닫힘/절전) → '비정상 종료 (마지막 자동저장 기준)' 후 비활성 처리
+    """
+    cutoff = time.time() - HEARTBEAT_TIMEOUT
+    with db() as conn:
+        targets = conn.execute(
+            """
+            SELECT session_uuid, is_active FROM watch_logs
+            WHERE session_uuid IS NOT NULL AND session_seconds > 0
+              AND (synced_seconds IS NULL OR synced_seconds <> session_seconds)
+              AND (is_active = 0 OR last_heartbeat < ?)
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    for session_uuid, is_active in targets:
+        status = ("비정상 종료 (마지막 자동저장 기준)" if is_active
+                  else "시청 완료 (정지)")
+        try:
+            if _push_session_to_sheet(session_uuid, status) and is_active:
+                with db() as conn:
+                    # 그 사이 하트비트가 다시 살아난 세션은 건드리지 않음
+                    conn.execute(
+                        "UPDATE watch_logs SET is_active = 0 "
+                        "WHERE session_uuid = ? AND last_heartbeat < ?",
+                        (session_uuid, cutoff),
+                    )
+        except Exception as e:
+            print(f"미반영 세션 시트 동기화 실패({session_uuid}): {e}")
+            get_sheet.clear()
+            break  # 시트 장애/쿼터 문제일 수 있으니 이번 회차는 중단, 다음 회차에 재시도
+
+
+@st.cache_resource
+def start_reconciler():
+    """서버 프로세스당 1회만 시작되는 백그라운드 점검 스레드"""
+    def loop():
+        while True:
+            time.sleep(RECONCILE_INTERVAL)
+            try:
+                reconcile_unsynced()
+            except Exception as e:
+                print(f"백그라운드 점검 오류: {e}")
+
+    t = threading.Thread(target=loop, daemon=True, name="sheet-reconciler")
+    t.start()
+    return t
 
 
 @st.cache_resource
@@ -207,10 +282,10 @@ def restore_from_sheet_if_empty():
                 INSERT OR IGNORE INTO watch_logs
                 (session_uuid, registration_number, name, email,
                  session_start_time, session_end_time, session_seconds,
-                 last_heartbeat, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
+                 last_heartbeat, is_active, synced_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
                 """,
-                (r[0], r[2], r[3], r[4], r[5], r[6], sec),
+                (r[0], r[2], r[3], r[4], r[5], r[6], sec, sec),
             )
             restored += cur.rowcount
     return restored
@@ -396,6 +471,8 @@ try:
         st.toast(f"구글 시트에서 {restored_n}건의 시청 기록을 복원했습니다.", icon="♻️")
 except Exception as e:
     st.warning(f"⚠ 구글 시트 복원 확인 중 오류가 발생했습니다(다음 접속 시 재시도): {e}")
+
+start_reconciler()
 
 settings = get_settings()
 target_seconds = settings["target_min"] * 60
