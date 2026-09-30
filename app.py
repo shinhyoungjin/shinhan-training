@@ -5,7 +5,7 @@ from datetime import datetime
 import time
 import json
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 # ==========================================
 # 1. DB 설정 및 초기화
@@ -15,7 +15,7 @@ DB_FILE = "watch_history.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # 개별 시청 상세 이력 테이블 (session_id 추가)
+    # 개별 시청 상세 이력 테이블 (session_id 포함)
     c.execute('''
         CREATE TABLE IF NOT EXISTS watch_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,16 +35,17 @@ def init_db():
 init_db()
 
 # ==========================================
-# 2. 구글 시트 연동 함수 (DB 원자적 동기화)
+# 2. 구글 시트 연동 함수 (최신 google-auth 적용)
 # ==========================================
 def get_gspread_client():
     try:
         scope = [
-            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
         creds_dict = json.loads(st.secrets["gcp_service_account"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        # 최신 google-auth 인증 방식
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
@@ -53,7 +54,7 @@ def get_gspread_client():
 
 def sync_db_log_to_sheet(log_id):
     """
-    watch_logs DB에서 최신 데이터를 읽어 구글 시트에 1:1로 정확히 동기화합니다.
+    watch_logs DB에서 최신 데이터를 읽어 구글 시트에 1:1로 원자적 동기화합니다.
     """
     client = get_gspread_client()
     if not client:
@@ -72,7 +73,6 @@ def sync_db_log_to_sheet(log_id):
         if not row:
             return
 
-        # row: (id, session_id, user_id, user_name, session_start, last_watch_time, session_duration, total_duration, status)
         sheet = client.open_by_key(st.secrets["spreadsheet_id"]).sheet1
         records = sheet.get_all_values()
         
@@ -96,13 +96,12 @@ def sync_db_log_to_sheet(log_id):
             str(row[8])                   # 상태 (시청 중 / 완강)
         ]
 
-        # 헤더 자동 추가 (A~I열)
+        # 헤더 자동 생성 및 보정 (A~I열)
         headers = ["Log ID", "세션 ID", "사번", "이름", "최초시작시각", "최종시청시각", "이번세션시청시간", "총누적시청시간", "상태"]
         if not records:
             sheet.append_row(headers)
             records = [headers]
         elif records[0] != headers:
-            # 헤더 열 순서나 항목이 기존과 다르면 1행 갱신
             sheet.update("A1:I1", [headers])
 
         # 기존 Log ID 행 탐색
@@ -113,10 +112,10 @@ def sync_db_log_to_sheet(log_id):
                 break
 
         if row_index:
-            # 기존 행 업데이트 (A~I열)
+            # 기존 행 업데이트
             sheet.update(f"A{row_index}:I{row_index}", [log_data])
         else:
-            # 신규 로그 행 추가
+            # 신규 행 추가
             sheet.append_row(log_data)
 
     except Exception as e:
@@ -137,7 +136,6 @@ def create_new_watch_log(session_id, user_id, user_name, total_duration):
     conn.commit()
     conn.close()
     
-    # 구글 시트에 최초 등록
     sync_db_log_to_sheet(log_id)
     return log_id
 
@@ -158,7 +156,6 @@ def update_watch_log(log_id, session_sec, total_sec, completed=False):
     conn.commit()
     conn.close()
 
-    # DB 업데이트 후 구글 시트동기화
     sync_db_log_to_sheet(log_id)
 
 # ==========================================
@@ -181,7 +178,6 @@ if sidebar_mode == "동영상 시청":
         st.session_state["user_id"] = user_id
         st.session_state["user_name"] = user_name
 
-        # 기존 완강 기록 중 최대 누적 시청시간 조회
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT MAX(total_duration) FROM watch_logs WHERE user_id = ? AND status = '완강 (수료)'", (user_id,))
@@ -189,9 +185,7 @@ if sidebar_mode == "동영상 시청":
         base_prior_duration = past_record if past_record else 0
         conn.close()
 
-        # 세션 초기화 (새로운 세션 ID 생성)
         if "current_log_id" not in st.session_state or st.session_state.get("active_user") != user_id:
-            # 세션 ID 형태: USER001_20260930_140853
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             session_id = f"{user_id}_{timestamp_str}"
             
@@ -200,18 +194,15 @@ if sidebar_mode == "동영상 시청":
             st.session_state["session_start_time"] = time.time()
             st.session_state["prior_duration"] = base_prior_duration
             
-            # DB 로그 생성
             log_id = create_new_watch_log(session_id, user_id, user_name, base_prior_duration)
             st.session_state["current_log_id"] = log_id
 
-        # 실시간 시청시간 계산
         elapsed_session_sec = int(time.time() - st.session_state["session_start_time"])
         total_accumulated_sec = st.session_state["prior_duration"] + elapsed_session_sec
 
         TARGET_SEC = 3000
         is_completed = total_accumulated_sec >= TARGET_SEC
 
-        # UI 현황 표시
         st.subheader("⏱️ 나의 학습 현황")
         st.caption(f"현재 세션 ID: `{st.session_state.get('session_id', '')}`")
         
@@ -225,7 +216,6 @@ if sidebar_mode == "동영상 시청":
 
         st.video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
-        # DB 및 구글 시트 동기화
         update_watch_log(
             st.session_state["current_log_id"],
             elapsed_session_sec,
@@ -240,7 +230,7 @@ if sidebar_mode == "동영상 시청":
         st.info("사번과 이름을 입력하셔야 시청 기록이 저장됩니다.")
 
 elif sidebar_mode == "관리자 메뉴":
-    st.title("🛠️ 관리자 메뉴")
+    st.title("🛠️️ 관리자 메뉴")
     
     tab1, tab2 = st.tabs(["1. 사용자별 최종 요약", "2. 시청 기록 다운로드 (개별 상세 이력)"])
 
