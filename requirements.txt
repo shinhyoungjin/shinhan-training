@@ -1,3 +1,5 @@
 streamlit
 pandas
 pytz
+gspread
+google-auth
