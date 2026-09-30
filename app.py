@@ -31,13 +31,13 @@ def get_gspread_client():
     return None
 
 # ==========================================================
-# 개선된 구글 시트 백업 기능 (열 구성 명확화 & 종료시각 버그 수정)
+# 개선된 구글 시트 백업 기능 (개별 시청 상세 이력 + 세션 ID)
 # ==========================================================
-def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, session_sec, total_watched_sec, is_final_save=False):
+def backup_to_google_sheet_session(log_id, reg_num, name, email, start_time, end_time, session_sec, total_watched_sec, is_final_save=False):
     """
-    구글 시트에 세션별로 기록합니다.
-    [1열: 세션ID, 2열: 등록번호, 3열: 성명, 4열: 이메일, 5열: 시청 시작 시각, 
-     6열: 시청 종료/저장 시각, 7열: 이번 세션 시청시간, 8열: 총 누적 시청시간, 9열: 이수 상태]
+    관리자 메뉴 [2. 개별 시청 상세 이력로그] 정보와 동일한 칼럼 구조에 "세션 ID"를 1열로 포함하여 구글 시트에 이관 기록합니다.
+    [1열: 세션 ID, 2열: 로그ID, 3열: 등록번호, 4열: 성명, 5열: 이메일, 
+     6열: 시청시작시각(KST), 7열: 최종시청/저장시각(KST), 8열: 해당세션_시청시간, 9열: 해당세션_시청초, 10열: 상태]
     """
     now = time.time()
     last_saved = st.session_state.get("last_gsheet_save_time", 0)
@@ -58,24 +58,26 @@ def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, s
         all_values = sheet.get_all_values()
         if len(all_values) == 0:
             header = [
-                "세션 ID", "등록번호", "성명", "이메일", 
-                "시청 시작 시각 (KST)", "시청 종료/저장 시각 (KST)", 
-                "이번 세션 시청시간", "총 누적 시청시간", "상태"
+                "세션 ID", "로그ID", "등록번호", "성명", "이메일", 
+                "시청시작시각(KST)", "최종시청/저장시각(KST)", 
+                "해당세션_시청시간", "해당세션_시청초", "상태"
             ]
             sheet.append_row(header)
             all_values = sheet.get_all_values()
 
         # 시청 시간 포맷팅
         session_time_str = f"{session_sec // 60}분 {session_sec % 60}초"
-        total_time_str = f"{total_watched_sec // 60}분 {total_watched_sec % 60}초"
         status_str = "시청 완료 (정지)" if is_final_save else "시청 중 (자동저장)"
+        display_log_id = log_id if log_id is not None else "생성중"
 
         # ① 최초 1회만 새로운 줄 생성 (새 세션 ID 발급)
         if "gsheet_row_num" not in st.session_state:
-            session_id = f"{reg_num}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
+            session_id = f"SESS_{reg_num}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
+            st.session_state["current_session_id"] = session_id
+
             new_row = [
-                session_id, reg_num, name, email, 
-                start_time, end_time, session_time_str, total_time_str, status_str
+                session_id, display_log_id, reg_num, name, email, 
+                start_time, end_time, session_time_str, session_sec, status_str
             ]
             sheet.append_row(new_row)
             
@@ -87,11 +89,12 @@ def backup_to_google_sheet_session(reg_num, name, email, start_time, end_time, s
         # ② 기존 세션 행이 이미 생성되어 있는 경우 -> 해당 행 값들 업데이트
         row_num = st.session_state["gsheet_row_num"]
         
-        # 셀 개별 덮어쓰기 (5열~9열)
-        sheet.update_cell(row_num, 6, end_time)          # 6열: 시청 종료/저장 시각
-        sheet.update_cell(row_num, 7, session_time_str)  # 7열: 이번 세션 시청시간
-        sheet.update_cell(row_num, 8, total_time_str)    # 8열: 총 누적 시청시간
-        sheet.update_cell(row_num, 9, status_str)        # 9열: 상태
+        # 데이터 업데이트 (2열~10열)
+        sheet.update_cell(row_num, 2, display_log_id)      # 2열: 로그ID
+        sheet.update_cell(row_num, 7, end_time)            # 7열: 최종시청/저장시각(KST)
+        sheet.update_cell(row_num, 8, session_time_str)    # 8열: 해당세션_시청시간
+        sheet.update_cell(row_num, 9, session_sec)         # 9열: 해당세션_시청초
+        sheet.update_cell(row_num, 10, status_str)         # 10열: 상태
         
         st.session_state["last_gsheet_save_time"] = now
         return True
@@ -268,7 +271,7 @@ if not users_df.empty:
 st.sidebar.markdown("---")
 
 # 관리자 메뉴
-with st.sidebar.expander("⚙️ 관리자 메뉴"):
+with st.sidebar.expander("⚙️️ 관리자 메뉴"):
     admin_pw = st.text_input("관리자 비밀번호", type="password")
     if admin_pw == settings["password"]:
         st.success("관리자 인증 성공")
@@ -327,7 +330,7 @@ with st.sidebar.expander("⚙️ 관리자 메뉴"):
                 'session_seconds': '해당세션_시청초'
             })
             logs_export['해당세션_시청시간'] = logs_export['해당세션_시청초'].apply(lambda x: f"{x // 60}분 {x % 60}초")
-            logs_export = logs_export[['로그ID', '등록번호', '성명', '이메일', '시청시작시각(KST)', '최종시청/저장시각(KST)', '해당세션_시청시간']]
+            logs_export = logs_export[['로그ID', '등록번호', '성명', '이메일', '시청시작시각(KST)', '최종시청/저장시각(KST)', '해당세션_시청시간', '해당세션_시청초']]
 
             csv_logs = logs_export.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
@@ -382,7 +385,7 @@ else:
                     end_str = get_kst_now_str()
                     
                     # 1. 로컬 SQLite DB 저장
-                    upsert_watch_session(
+                    log_id = upsert_watch_session(
                         st.session_state.current_log_id,
                         current_user['registration_number'],
                         current_user['name'],
@@ -394,6 +397,7 @@ else:
                     
                     # 2. 구글 백업 시트 최종 정지 저장
                     backup_to_google_sheet_session(
+                        log_id,
                         current_user['registration_number'],
                         current_user['name'],
                         current_user['email'],
@@ -470,6 +474,7 @@ else:
 
         # 구글 백업 시트에 30초 간격으로 현재 세션 행에만 덮어쓰기
         backup_to_google_sheet_session(
+            st.session_state.current_log_id,
             current_user['registration_number'],
             current_user['name'],
             current_user['email'],
