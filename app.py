@@ -29,18 +29,30 @@ def get_gspread_client():
         pass
     return None
 
-# 구글 시트에 실시간 로그 백업 전송
+# 구글 시트에 실시간 로그 백업 전송 (에러 원인 출력 버전)
 def backup_to_google_sheet(reg_num, name, email, start_time, end_time, session_sec):
     try:
         client = get_gspread_client()
-        if client and "backup_sheet_url" in st.secrets:
-            sheet = client.open_by_url(st.secrets["backup_sheet_url"]).sheet1
-            time_str = f"{session_sec // 60}분 {session_sec % 60}초"
-            row = [reg_num, name, email, start_time, end_time, session_sec, time_str]
-            sheet.append_row(row)
-    except Exception as e:
-        st.caption(f"⚠️ 구글 백업 중 연동 알림: {e}")
+        if client is None:
+            st.error("❌ 구글 서비스 계정 인증 실패: Secrets의 [gcp_service_account] 설정을 확인하세요.")
+            return
+            
+        if "backup_sheet_url" not in st.secrets:
+            st.error("❌ Secrets에 'backup_sheet_url' 설정이 누락되었습니다.")
+            return
 
+        # 백업 시트 열기
+        spreadsheet = client.open_by_url(st.secrets["backup_sheet_url"])
+        sheet = spreadsheet.sheet1  # 첫 번째 시트(Sheet1) 선택
+        
+        time_str = f"{session_sec // 60}분 {session_sec % 60}초"
+        row = [reg_num, name, email, start_time, end_time, session_sec, time_str]
+        
+        sheet.append_row(row)
+        st.success("✅ 구글 스프레드시트에 성공적으로 백업 기록이 전송되었습니다!")
+        
+    except Exception as e:
+        st.error(f"❌ 구글 백업 중 상세 에러 발생: {e}")
 # --- 1. 페이지 기본 설정 ---
 st.set_page_config(
     page_title="법인 임직원 온라인 교육 시스템",
