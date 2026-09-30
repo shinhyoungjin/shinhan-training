@@ -31,22 +31,38 @@ def get_gspread_client():
     return None
 
 # ==========================================================
-# 개선된 구글 시트 백업 기능 (개별 시청 상세 이력 + 세션 ID)
+# 개선된 구글 시트 이관(Sync) 기능
+# Streamlit 로컬 SQLite DB의 실제 저장된 기록을 읽어 구글 시트로 이관
 # ==========================================================
-def backup_to_google_sheet_session(log_id, reg_num, name, email, start_time, end_time, session_sec, total_watched_sec, is_final_save=False):
+def sync_db_log_to_google_sheet(log_id, target_minutes, is_final_save=False):
     """
-    관리자 메뉴 [2. 개별 시청 상세 이력로그] 정보와 동일한 칼럼 구조에 "세션 ID"를 1열로 포함하여 구글 시트에 이관 기록합니다.
-    [1열: 세션 ID, 2열: 로그ID, 3열: 등록번호, 4열: 성명, 5열: 이메일, 
-     6열: 시청시작시각(KST), 7열: 최종시청/저장시각(KST), 8열: 해당세션_시청시간, 9열: 해당세션_시청초, 10열: 상태]
+    로컬 DB의 watch_logs 테이블에서 해당 log_id의 실제 저장을 확인한 후
+    구글 시트에 동기화하여 수치 불일치 및 창 닫힘 오차를 방지합니다.
     """
     now = time.time()
     last_saved = st.session_state.get("last_gsheet_save_time", 0)
 
-    # 수동 일시정지가 아니면 30초 간격 제한 적용 (구글 API 쿼터 보호)
+    # 정지(완료)가 아닌 자동 동기화 시 30초 간격 제한 (구글 API 쿼터 보호)
     if not is_final_save and (now - last_saved < 30) and ("gsheet_row_num" in st.session_state):
         return True
 
     try:
+        # 1. DB에서 최신 시청 이력 1건 조회
+        conn = sqlite3.connect('training_data.db')
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, registration_number, name, email, session_start_time, session_end_time, session_seconds
+            FROM watch_logs
+            WHERE id = ?
+        """, (log_id,))
+        log_data = c.fetchone()
+        conn.close()
+
+        if not log_data:
+            return False
+
+        log_id_val, reg_num, name, email, start_time, end_time, session_sec = log_data
+
         client = get_gspread_client()
         if client is None or "backup_sheet_url" not in st.secrets:
             return False
@@ -54,7 +70,7 @@ def backup_to_google_sheet_session(log_id, reg_num, name, email, start_time, end
         spreadsheet = client.open_by_url(st.secrets["backup_sheet_url"])
         sheet = spreadsheet.sheet1
         
-        # 시트가 아예 비어있을 경우 헤더(열 제목) 생성
+        # 2. 헤더(열 제목)가 없다면 최초 생성
         all_values = sheet.get_all_values()
         if len(all_values) == 0:
             header = [
@@ -65,18 +81,20 @@ def backup_to_google_sheet_session(log_id, reg_num, name, email, start_time, end
             sheet.append_row(header)
             all_values = sheet.get_all_values()
 
-        # 시청 시간 포맷팅
+        # 데이터 변환
         session_time_str = f"{session_sec // 60}분 {session_sec % 60}초"
         status_str = "시청 완료 (정지)" if is_final_save else "시청 중 (자동저장)"
-        display_log_id = log_id if log_id is not None else "생성중"
 
-        # ① 최초 1회만 새로운 줄 생성 (새 세션 ID 발급)
+        # 3. 구글 시트 행 추가 또는 업데이트
         if "gsheet_row_num" not in st.session_state:
-            session_id = f"SESS_{reg_num}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
-            st.session_state["current_session_id"] = session_id
+            # 세션 ID 생성
+            session_id = st.session_state.get("current_session_id")
+            if not session_id:
+                session_id = f"SESS_{reg_num}_{dt.now().strftime('%Y%m%d_%H%M%S')}"
+                st.session_state["current_session_id"] = session_id
 
             new_row = [
-                session_id, display_log_id, reg_num, name, email, 
+                session_id, log_id_val, reg_num, name, email, 
                 start_time, end_time, session_time_str, session_sec, status_str
             ]
             sheet.append_row(new_row)
@@ -86,11 +104,10 @@ def backup_to_google_sheet_session(log_id, reg_num, name, email, start_time, end
             st.session_state["last_gsheet_save_time"] = now
             return True
 
-        # ② 기존 세션 행이 이미 생성되어 있는 경우 -> 해당 행 값들 업데이트
+        # 이미 생성된 행 위치로 업데이트
         row_num = st.session_state["gsheet_row_num"]
         
-        # 데이터 업데이트 (2열~10열)
-        sheet.update_cell(row_num, 2, display_log_id)      # 2열: 로그ID
+        sheet.update_cell(row_num, 2, log_id_val)          # 2열: 로그ID
         sheet.update_cell(row_num, 7, end_time)            # 7열: 최종시청/저장시각(KST)
         sheet.update_cell(row_num, 8, session_time_str)    # 8열: 해당세션_시청시간
         sheet.update_cell(row_num, 9, session_sec)         # 9열: 해당세션_시청초
@@ -100,7 +117,7 @@ def backup_to_google_sheet_session(log_id, reg_num, name, email, start_time, end
         return True
 
     except Exception as e:
-        print(f"구글 백업 업데이트 중 일시적 예외: {e}")
+        print(f"구글 백업 이관 동기화 예외: {e}")
         return False
 
 # --- 1. 페이지 기본 설정 ---
@@ -234,7 +251,7 @@ target_seconds = settings["target_min"] * 60
 
 # --- 5. 메인 UI ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
-st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (구글 드라이브 실시간 이중 백업 연동)")
+st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (로컬 DB 기반 구글 시트 이관 백업 연동)")
 
 # 사이드바
 st.sidebar.header("👤 수강자 확인")
@@ -264,6 +281,8 @@ if not users_df.empty:
             st.session_state.current_log_id = None
             if "gsheet_row_num" in st.session_state:
                 del st.session_state["gsheet_row_num"]
+            if "current_session_id" in st.session_state:
+                del st.session_state["current_session_id"]
             
         current_user = users_df[users_df['registration_number'] == reg_num].iloc[0]
         st.sidebar.success(f"확인됨: **{current_user['name']}** 님")
@@ -271,7 +290,7 @@ if not users_df.empty:
 st.sidebar.markdown("---")
 
 # 관리자 메뉴
-with st.sidebar.expander("⚙️️ 관리자 메뉴"):
+with st.sidebar.expander("⚙ 관리자 메뉴"):
     admin_pw = st.text_input("관리자 비밀번호", type="password")
     if admin_pw == settings["password"]:
         st.success("관리자 인증 성공")
@@ -346,6 +365,7 @@ with st.sidebar.expander("⚙️️ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
+    # DB에 누적 저장을 기준으로 총 시청시간 산출
     db_watched_sec = get_user_total_seconds(current_user['registration_number'])
     
     if st.session_state.current_log_id is not None:
@@ -375,16 +395,18 @@ else:
                 st.session_state.current_log_id = None
                 st.session_state.current_session_sec = 0
                 
-                # 새로 접속/재시작 시 구글 시트 행 추적 번호 초기화
+                # 새로 시작 시 구글 시트 행 추적 번호 초기화
                 if "gsheet_row_num" in st.session_state:
                     del st.session_state["gsheet_row_num"]
+                if "current_session_id" in st.session_state:
+                    del st.session_state["current_session_id"]
                 st.rerun()
         else:
             if st.button("⏸️ 일시 정지 및 DB 저장", use_container_width=True):
                 if st.session_state.current_session_sec > 0:
                     end_str = get_kst_now_str()
                     
-                    # 1. 로컬 SQLite DB 저장
+                    # 1. 로컬 SQLite DB 저장 (Single Source of Truth)
                     log_id = upsert_watch_session(
                         st.session_state.current_log_id,
                         current_user['registration_number'],
@@ -395,16 +417,10 @@ else:
                         st.session_state.current_session_sec
                     )
                     
-                    # 2. 구글 백업 시트 최종 정지 저장
-                    backup_to_google_sheet_session(
+                    # 2. 저장 완료된 DB 데이터를 읽어서 구글 시트로 최종 이관
+                    sync_db_log_to_google_sheet(
                         log_id,
-                        current_user['registration_number'],
-                        current_user['name'],
-                        current_user['email'],
-                        st.session_state.session_start_str,
-                        end_str,
-                        st.session_state.current_session_sec,
-                        total_watched_sec,
+                        settings['target_min'],
                         is_final_save=True
                     )
 
@@ -414,6 +430,8 @@ else:
                 st.session_state.session_start_str = None
                 if "gsheet_row_num" in st.session_state:
                     del st.session_state["gsheet_row_num"]
+                if "current_session_id" in st.session_state:
+                    del st.session_state["current_session_id"]
                 st.rerun()
 
         progress = min(total_watched_sec / target_seconds, 1.0)
@@ -422,7 +440,7 @@ else:
         current_min = total_watched_sec // 60
         current_sec = total_watched_sec % 60
         st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-        st.caption("🔒 시청 시간은 실시간 자동 저장되며, 구글 드라이브에 안전하게 이중 백업됩니다.")
+        st.caption("🔒 시청 기록은 SQLite DB 저장을 거쳐 구글 드라이브에 실시간으로 오차 없이 동기화됩니다.")
 
     with col2:
         st.markdown("### 📝 이수 상태")
@@ -450,7 +468,7 @@ else:
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
-    # 1초 타이머 + 5초 로컬 DB 자동 업데이트 + 30초 구글 백업 시트 갱신
+    # 1초 타이머 + 5초 로컬 DB 자동 업데이트 + 30초 구글 백업 이관
     if st.session_state.is_playing:
         time.sleep(1)
         st.session_state.current_session_sec += 1
@@ -458,7 +476,7 @@ else:
         now = time.time()
         end_str = get_kst_now_str()
         
-        # 5초마다 로컬 SQLite DB 상시 업데이트
+        # 1. [5초마다] 로컬 SQLite DB 저장 (우선 반영)
         if now - st.session_state.last_autosave_time >= 5:
             log_id = upsert_watch_session(
                 st.session_state.current_log_id,
@@ -472,17 +490,11 @@ else:
             st.session_state.current_log_id = log_id
             st.session_state.last_autosave_time = now
 
-        # 구글 백업 시트에 30초 간격으로 현재 세션 행에만 덮어쓰기
-        backup_to_google_sheet_session(
-            st.session_state.current_log_id,
-            current_user['registration_number'],
-            current_user['name'],
-            current_user['email'],
-            st.session_state.session_start_str,
-            end_str,
-            st.session_state.current_session_sec,
-            total_watched_sec,
-            is_final_save=False
-        )
+            # 2. [DB에 저장 완료된 log_id가 있을 때] 30초 간격으로 DB 기록을 구글 시트로 이관
+            sync_db_log_to_google_sheet(
+                log_id,
+                settings['target_min'],
+                is_final_save=False
+            )
 
         st.rerun()
