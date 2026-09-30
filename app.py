@@ -97,7 +97,7 @@ def sync_db_log_to_google_sheet(log_id, target_minutes, is_final_save=False):
         # 이미 세션 행이 지정되어 있는 경우 -> DB와 완전히 동일한 값으로 덮어쓰기
         row_num = st.session_state["gsheet_row_num"]
         
-        # 구글 시트 특정 셀 범위 일괄 업데이트 (네트워크 오버헤드 최소화)
+        # 구글 시트 B열부터 J열까지 일괄 업데이트
         sheet.update(
             f"B{row_num}:J{row_num}",
             [[log_id_val, reg_num, name, email, start_time, end_time, session_time_str, session_sec, status_str]]
@@ -231,6 +231,8 @@ if 'last_autosave_time' not in st.session_state:
     st.session_state.last_autosave_time = time.time()
 if 'session_start_str' not in st.session_state:
     st.session_state.session_start_str = None
+if 'session_start_timestamp' not in st.session_state:
+    st.session_state.session_start_timestamp = None
 if 'current_log_id' not in st.session_state:
     st.session_state.current_log_id = None
 
@@ -239,7 +241,7 @@ target_seconds = settings["target_min"] * 60
 
 # --- 5. 메인 UI ---
 st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
-st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (SQLite DB 기반 구글 시트 실시간 이관 연동)")
+st.caption("시청 완료 조건: 지정된 누적 시간 이상 시청 시 자동 이수 완료 (실제 시계 타임스탬프 기반 오차 없는 동기화)")
 
 # 사이드바
 st.sidebar.header("👤 수강자 확인")
@@ -266,6 +268,7 @@ if not users_df.empty:
             st.session_state.is_playing = False
             st.session_state.current_session_sec = 0
             st.session_state.session_start_str = None
+            st.session_state.session_start_timestamp = None
             st.session_state.current_log_id = None
             if "gsheet_row_num" in st.session_state:
                 del st.session_state["gsheet_row_num"]
@@ -353,7 +356,11 @@ with st.sidebar.expander("⚙ 관리자 메뉴"):
 if current_user is None:
     st.warning("👈 왼쪽 사이드바에서 본인의 이름을 먼저 선택해 주세요.")
 else:
-    # DB에 누적 저장을 기준으로 총 시청시간 산출
+    # 1. 실제 경과 시간 계산 (System Clock 기반 지연 보정)
+    if st.session_state.is_playing and st.session_state.session_start_timestamp:
+        st.session_state.current_session_sec = int(time.time() - st.session_state.session_start_timestamp)
+
+    # 2. DB 누적시간 + 이번 세션 실시간 시청시간 계산
     db_watched_sec = get_user_total_seconds(current_user['registration_number'])
     
     if st.session_state.current_log_id is not None:
@@ -378,6 +385,7 @@ else:
         if not st.session_state.is_playing:
             if st.button("▶️ 영상 시청 시작 / 재개", use_container_width=True):
                 st.session_state.is_playing = True
+                st.session_state.session_start_timestamp = time.time()
                 st.session_state.last_autosave_time = time.time()
                 st.session_state.session_start_str = get_kst_now_str()
                 st.session_state.current_log_id = None
@@ -404,7 +412,7 @@ else:
                         st.session_state.current_session_sec
                     )
                     
-                    # 2. DB 저장 완료된 데이터를 구글 시트로 최종 즉시 이관
+                    # 2. 구글 시트로 최종 즉시 이관
                     sync_db_log_to_google_sheet(
                         log_id,
                         settings['target_min'],
@@ -413,6 +421,7 @@ else:
 
                 st.session_state.is_playing = False
                 st.session_state.current_session_sec = 0
+                st.session_state.session_start_timestamp = None
                 st.session_state.current_log_id = None
                 st.session_state.session_start_str = None
                 if "gsheet_row_num" in st.session_state:
@@ -427,7 +436,7 @@ else:
         current_min = total_watched_sec // 60
         current_sec = total_watched_sec % 60
         st.metric("총 누적 시청 시간", f"{current_min}분 {current_sec}초 / {settings['target_min']}분")
-        st.caption("🔒 로컬 SQLite DB에 실시간 저장된 시청 기록이 구글 드라이브 시트로 1:1 완벽하게 이관됩니다.")
+        st.caption("🔒 실제 컴퓨터 시계 기반(System Clock)으로 실시간 동기화되어 지연 오차가 발생하지 않습니다.")
 
     with col2:
         st.markdown("### 📝 이수 상태")
@@ -455,17 +464,13 @@ else:
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
-    # 타이머 및 즉시 동기화 파이프라인
+    # 실시간 타임스탬프 루프 및 5초 주기 DB/구글시트 이관
     if st.session_state.is_playing:
-        time.sleep(1)
-        st.session_state.current_session_sec += 1
-        
         now = time.time()
         end_str = get_kst_now_str()
         
-        # 5초마다 SQLite DB 저장 후 완료되면 구글 시트로 즉시 이관
+        # 5초마다 SQLite DB 저장 및 구글 시트 1:1 이관
         if now - st.session_state.last_autosave_time >= 5:
-            # Step 1: SQLite DB 저장 (Singular Truth Data 생성)
             log_id = upsert_watch_session(
                 st.session_state.current_log_id,
                 current_user['registration_number'],
@@ -478,11 +483,12 @@ else:
             st.session_state.current_log_id = log_id
             st.session_state.last_autosave_time = now
 
-            # Step 2: DB 저장이 확정된 log_id 데이터를 읽어 구글 시트로 즉시 동기화
+            # DB에 저장 완료된 지표를 읽어 구글 시트에 실시간 반영
             sync_db_log_to_google_sheet(
                 log_id,
                 settings['target_min'],
                 is_final_save=False
             )
 
+        time.sleep(1)
         st.rerun()
