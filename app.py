@@ -1,4 +1,6 @@
 import hmac
+import logging
+import os
 import sqlite3
 import threading
 import time
@@ -11,6 +13,27 @@ import pandas as pd
 import pytz
 import streamlit as st
 from google.oauth2.service_account import Credentials
+
+# ==========================================================
+# 진단 로그 (테스트용)
+# ==========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [DIAG] %(message)s",
+)
+logger = logging.getLogger("training_app_diag")
+APP_START_TS = time.perf_counter()
+
+def diag(msg):
+    logger.info(msg)
+
+def diag_elapsed(label, start_ts):
+    elapsed = time.perf_counter() - start_ts
+    logger.info("%s 완료: elapsed=%.3fs", label, elapsed)
+    return elapsed
+
+diag("===== 앱 요청/실행 시작 =====")
+diag("process=%s", os.getpid())
 
 # ==========================================================
 # 상수
@@ -74,6 +97,8 @@ def db():
 # DB 초기화
 # ==========================================================
 def init_db():
+    _diag_ts = time.perf_counter()
+    diag("init_db 시작")
     with db() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
@@ -308,6 +333,8 @@ class SheetBackup:
             found.setdefault(slot, (slot, f"과목 {slot}", "", 50, 0))
         return [found[s] for s in sorted(found)]
 
+
+    diag_elapsed("init_db", _diag_ts)
 
 @st.cache_resource
 def get_backup():
@@ -576,6 +603,8 @@ def heartbeat_tick():
 # ==========================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_users_from_google_sheet():
+    _diag_ts = time.perf_counter()
+    diag("Google Sheets 수강자 명단 조회 시작")
     sheet_url = (
         "https://docs.google.com/spreadsheets/d/"
         "1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0"
@@ -634,6 +663,7 @@ def render_backup_status(backup):
 # ===== MAIN =====
 # ==========================================================
 init_db()
+diag_elapsed("초기 import/환경 준비", APP_START_TS)
 backup = get_backup()
 st.session_state["_backup_ref"] = backup
 
