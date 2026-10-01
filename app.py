@@ -24,8 +24,8 @@ logging.basicConfig(
 logger = logging.getLogger("training_app_diag")
 APP_START_TS = time.perf_counter()
 
-def diag(msg):
-    logger.info(msg)
+def diag(msg, *args):
+    logger.info(msg, *args)
 
 def diag_elapsed(label, start_ts):
     elapsed = time.perf_counter() - start_ts
