@@ -1,6 +1,5 @@
 import hmac
 import logging
-import os
 import sqlite3
 import threading
 import time
@@ -15,30 +14,26 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 
 # ==========================================================
-# 진단 로그 (테스트용)
-# ==========================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [DIAG] %(message)s",
-)
-logger = logging.getLogger("training_app_diag")
-APP_START_TS = time.perf_counter()
-
-def diag(msg, *args):
-    logger.info(msg, *args)
-
-def diag_elapsed(label, start_ts):
-    elapsed = time.perf_counter() - start_ts
-    logger.info("%s 완료: elapsed=%.3fs", label, elapsed)
-    return elapsed
-
-diag("===== 앱 요청/실행 시작 =====")
-diag("process=%s", os.getpid())
-
-# ==========================================================
 # 상수
 # ==========================================================
 DB_PATH = "training_data.db"
+# ===== 진단 로그 =====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [DIAG] %(message)s")
+logger = logging.getLogger(__name__)
+
+def diag(msg, *args):
+    try:
+        logger.info(msg, *args)
+    except Exception:
+        pass
+
+def diag_elapsed(name, started):
+    try:
+        logger.info("%s 완료: %.3f초", name, time.time() - started)
+    except Exception:
+        pass
+# ===== 진단 로그 끝 =====
+
 NUM_COURSES = 3               # 과목(영상) 수
 DB_SAVE_INTERVAL = 5          # DB 자동저장(=하트비트) 주기(초)
 SHEET_SYNC_INTERVAL = 60      # 구글 시트 배치 동기화 주기(초)
@@ -97,8 +92,6 @@ def db():
 # DB 초기화
 # ==========================================================
 def init_db():
-    _diag_ts = time.perf_counter()
-    diag("init_db 시작")
     with db() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
@@ -334,13 +327,15 @@ class SheetBackup:
         return [found[s] for s in sorted(found)]
 
 
-    diag_elapsed("init_db", _diag_ts)
-
 @st.cache_resource
 def get_backup():
+    _diag_ts = time.time()
     if "gcp_service_account" not in st.secrets or "backup_sheet_url" not in st.secrets:
+        diag("Google Sheets 백업 설정 없음")
         return None
-    return SheetBackup(dict(st.secrets["gcp_service_account"]), st.secrets["backup_sheet_url"])
+    backup = SheetBackup(dict(st.secrets["gcp_service_account"]), st.secrets["backup_sheet_url"])
+    diag_elapsed("Google Sheets 백업 객체 생성", _diag_ts)
+    return backup
 
 
 def wake_backup():
@@ -351,12 +346,15 @@ def wake_backup():
 
 @st.cache_resource
 def restore_logs_once(_backup):
+    _diag_ts = time.time()
     """
     서버(프로세스) 시작 후 1회: DB에 시청 기록이 없으면 시트에서 복원합니다.
     실패하면 예외 → 캐시되지 않아 다음 실행 때 재시도됩니다.
     """
     with db() as conn:
         if conn.execute("SELECT COUNT(*) FROM watch_logs").fetchone()[0] > 0:
+            diag("시청기록 복원 불필요: 기존 DB 기록 존재")
+            diag_elapsed("restore_logs_once", _diag_ts)
             return 0
 
     rows = _backup.read_log_rows()
@@ -384,6 +382,8 @@ def restore_logs_once(_backup):
                 (r[0], r[2], r[3], r[4], cid, r[6], r[7], r[8], sec, sec),
             )
             restored += cur.rowcount
+    diag("Google Sheets 시청기록 복원 건수=%s", restored)
+    diag_elapsed("restore_logs_once", _diag_ts)
     return restored
 
 
@@ -391,9 +391,11 @@ def restore_logs_once(_backup):
 # 과목 설정
 # ==========================================================
 def ensure_courses(backup):
+    _diag_ts = time.time()
     """courses 테이블이 비어 있으면 시트에서 복원하고, 없으면 기본값으로 채웁니다."""
     with db() as conn:
         if conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0] > 0:
+            diag_elapsed("ensure_courses", _diag_ts)
             return True
 
     rows = []
@@ -419,6 +421,7 @@ def ensure_courses(backup):
             "(slot_id, title, video_url, target_minutes, enabled) VALUES (?, ?, ?, ?, ?)",
             rows,
         )
+    diag_elapsed("ensure_courses", _diag_ts)
     return True
 
 
@@ -586,6 +589,7 @@ def heartbeat_tick():
     ss.current_session_sec = int(now - ss.session_start_ts)
 
     if now - ss.last_db_save >= DB_SAVE_INTERVAL:
+        _diag_db_ts = time.time()
         user = ss.session_user
         if has_other_active_session(user["reg"], ss.session_uuid):
             finalize_session()
@@ -596,6 +600,7 @@ def heartbeat_tick():
             get_kst_now_str(), ss.current_session_sec, active=True,
         )
         ss.last_db_save = now
+        diag_elapsed("heartbeat DB 저장", _diag_db_ts)
 
 
 # ==========================================================
@@ -603,8 +608,7 @@ def heartbeat_tick():
 # ==========================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_users_from_google_sheet():
-    _diag_ts = time.perf_counter()
-    diag("Google Sheets 수강자 명단 조회 시작")
+    _diag_ts = time.time()
     sheet_url = (
         "https://docs.google.com/spreadsheets/d/"
         "1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0"
@@ -616,7 +620,10 @@ def get_users_from_google_sheet():
         "rsm 메일": "email",
     })
     df["registration_number"] = df["registration_number"].str.strip()
-    return df[["registration_number", "name", "email"]]
+    result = df[["registration_number", "name", "email"]]
+    diag("수강자 명단 조회 완료: rows=%s", len(result))
+    diag_elapsed("get_users_from_google_sheet", _diag_ts)
+    return result
 
 
 # ==========================================================
@@ -662,8 +669,10 @@ def render_backup_status(backup):
 # ==========================================================
 # ===== MAIN =====
 # ==========================================================
+_app_diag_started = time.time()
+diag('===== 앱 실행 시작 =====')
 init_db()
-diag_elapsed("초기 import/환경 준비", APP_START_TS)
+diag_elapsed('init_db', _app_diag_started)
 backup = get_backup()
 st.session_state["_backup_ref"] = backup
 
@@ -701,6 +710,7 @@ st.sidebar.header("👤 수강자 확인")
 current_user = None
 try:
     users_df = get_users_from_google_sheet()
+    diag_elapsed("전체 초기 로딩", _app_diag_started)
 except Exception as e:
     users_df = pd.DataFrame(columns=["registration_number", "name", "email"])
     st.sidebar.error(f"명단을 불러오지 못했습니다: {e}")
