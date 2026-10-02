@@ -1,5 +1,5 @@
 import hmac
-import logging
+import io
 import sqlite3
 import threading
 import time
@@ -10,6 +10,7 @@ from datetime import datetime as dt
 import gspread
 import pandas as pd
 import pytz
+import requests
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
@@ -17,28 +18,18 @@ from google.oauth2.service_account import Credentials
 # 상수
 # ==========================================================
 DB_PATH = "training_data.db"
-# ===== 진단 로그 =====
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [DIAG] %(message)s")
-logger = logging.getLogger(__name__)
-
-def diag(msg, *args):
-    try:
-        logger.info(msg, *args)
-    except Exception:
-        pass
-
-def diag_elapsed(name, started):
-    try:
-        logger.info("%s 완료: %.3f초", name, time.time() - started)
-    except Exception:
-        pass
-# ===== 진단 로그 끝 =====
-
 NUM_COURSES = 3               # 과목(영상) 수
 DB_SAVE_INTERVAL = 5          # DB 자동저장(=하트비트) 주기(초)
 SHEET_SYNC_INTERVAL = 60      # 구글 시트 배치 동기화 주기(초)
 MIN_BATCH_GAP = 10            # 배치 동기화 최소 간격(초) - 쿼터 보호
 HEARTBEAT_TIMEOUT = 20        # 이 시간 이상 하트비트가 없으면 '죽은 세션'으로 간주(초)
+TICK_SECONDS = 2              # 시청 중 타이머 갱신 주기(초) - 서버 부하 때문에 1초가 아닌 2초
+DASHBOARD_REFRESH = 120       # 시청 중 대시보드 표 갱신 주기(초) - 표시용이라 드물게 갱신
+
+ROSTER_URL = ("https://docs.google.com/spreadsheets/d/"
+              "1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0")
+ROSTER_TTL = 21600            # 명단 갱신 주기(초) = 6시간 (바로 반영하려면 관리자 메뉴의 '명단 새로고침')
+ROSTER_TIMEOUT = 10           # 명단 요청 제한 시간(초)
 
 SETTINGS_TAB = "과목설정"
 SETTINGS_HEADER = ["과목ID", "과목명", "영상URL", "목표시청분", "사용여부"]
@@ -79,13 +70,29 @@ def fmt_sec(sec):
 
 
 @contextmanager
+def timed(label, warn_after=0.5):
+    """오래 걸린 단계를 서버 로그에 [perf]로 남깁니다. (느림 원인 추적용)"""
+    t0 = time.time()
+    try:
+        yield
+    finally:
+        d = time.time() - t0
+        if d >= warn_after:
+            print(f"[perf] {label}: {d:.2f}s", flush=True)
+
+
+@contextmanager
 def db():
+    t0 = time.time()
     conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+        d = time.time() - t0
+        if d >= 0.5:
+            print(f"[perf] DB 작업이 {d:.2f}s 걸림", flush=True)
 
 
 # ==========================================================
@@ -117,7 +124,8 @@ def init_db():
                 session_seconds INTEGER,
                 last_heartbeat REAL DEFAULT 0,
                 is_active INTEGER DEFAULT 0,
-                synced_seconds INTEGER
+                synced_seconds INTEGER,
+                synced_status TEXT
             )
         """)
         # 구버전 DB 보강
@@ -127,6 +135,7 @@ def init_db():
             ("last_heartbeat", "REAL DEFAULT 0"),
             ("is_active", "INTEGER DEFAULT 0"),
             ("synced_seconds", "INTEGER"),
+            ("synced_status", "TEXT"),
             ("course_title", "TEXT"),
         ]:
             if name not in cols:
@@ -210,7 +219,7 @@ class SheetBackup:
             return self._log_sheet().get_all_values()[1:]
 
     def run_batch(self):
-        """DB에서 미반영 세션을 모두 읽어 시트에 일괄 반영합니다."""
+        """DB에서 미반영(시간 또는 상태가 시트와 다른) 세션을 모두 읽어 시트에 일괄 반영합니다."""
         now = time.time()
         cutoff = now - HEARTBEAT_TIMEOUT
         with db() as conn:
@@ -221,14 +230,21 @@ class SheetBackup:
                        session_seconds, is_active, last_heartbeat
                 FROM watch_logs
                 WHERE session_uuid IS NOT NULL AND session_seconds > 0
-                  AND (synced_seconds IS NULL OR synced_seconds <> session_seconds)
-                """
+                  AND (synced_seconds IS NULL OR synced_seconds <> session_seconds
+                       OR synced_status IS NULL
+                       OR synced_status <> CASE
+                            WHEN is_active = 1 AND last_heartbeat >= ? THEN 'running'
+                            WHEN is_active = 1 THEN 'abnormal'
+                            ELSE 'done' END)
+                """,
+                (cutoff,),
             ).fetchall()
 
         if not rows:
             self.state.update(ok=True, error=None)
             return 0
 
+        labels = {"running": STATUS_RUNNING, "abnormal": STATUS_ABNORMAL, "done": STATUS_DONE}
         with self._guard():
             ws = self._log_sheet()
             pos = {}
@@ -236,24 +252,23 @@ class SheetBackup:
                 if v and v not in pos:
                     pos[v] = i
 
-            updates, appends, done, stale = [], [], [], []
+            updates, appends, done = [], [], []
             for (uid, log_id, reg, name, email, cid, ctitle, start, end,
                  sec, active, hb) in rows:
                 if active and hb < cutoff:
-                    status = STATUS_ABNORMAL
-                    stale.append(uid)
+                    key = "abnormal"      # 하트비트가 끊긴 활성 세션(창 닫힘/절전)
                 elif active:
-                    status = STATUS_RUNNING
+                    key = "running"
                 else:
-                    status = STATUS_DONE
+                    key = "done"
                 vals = [uid, log_id, reg, name, email, cid, ctitle or "",
-                        start, end, fmt_sec(sec), sec, status]
+                        start, end, fmt_sec(sec), sec, labels[key]]
                 if uid in pos:
                     r = pos[uid]
                     updates.append({"range": f"A{r}:{LAST_COL}{r}", "values": [vals]})
                 else:
                     appends.append(vals)
-                done.append((sec, uid))
+                done.append((sec, key, uid))
 
             if updates:
                 ws.batch_update(updates, value_input_option="RAW")
@@ -262,14 +277,9 @@ class SheetBackup:
 
         with db() as conn:
             conn.executemany(
-                "UPDATE watch_logs SET synced_seconds = ? WHERE session_uuid = ?", done
+                "UPDATE watch_logs SET synced_seconds = ?, synced_status = ? "
+                "WHERE session_uuid = ?", done,
             )
-            if stale:
-                conn.executemany(
-                    "UPDATE watch_logs SET is_active = 0 "
-                    "WHERE session_uuid = ? AND last_heartbeat < ?",
-                    [(u, cutoff) for u in stale],
-                )
         self.state.update(ok=True, error=None, last_success=time.time())
         return len(rows)
 
@@ -329,13 +339,9 @@ class SheetBackup:
 
 @st.cache_resource
 def get_backup():
-    _diag_ts = time.time()
     if "gcp_service_account" not in st.secrets or "backup_sheet_url" not in st.secrets:
-        diag("Google Sheets 백업 설정 없음")
         return None
-    backup = SheetBackup(dict(st.secrets["gcp_service_account"]), st.secrets["backup_sheet_url"])
-    diag_elapsed("Google Sheets 백업 객체 생성", _diag_ts)
-    return backup
+    return SheetBackup(dict(st.secrets["gcp_service_account"]), st.secrets["backup_sheet_url"])
 
 
 def wake_backup():
@@ -346,15 +352,12 @@ def wake_backup():
 
 @st.cache_resource
 def restore_logs_once(_backup):
-    _diag_ts = time.time()
     """
     서버(프로세스) 시작 후 1회: DB에 시청 기록이 없으면 시트에서 복원합니다.
     실패하면 예외 → 캐시되지 않아 다음 실행 때 재시도됩니다.
     """
     with db() as conn:
         if conn.execute("SELECT COUNT(*) FROM watch_logs").fetchone()[0] > 0:
-            diag("시청기록 복원 불필요: 기존 DB 기록 존재")
-            diag_elapsed("restore_logs_once", _diag_ts)
             return 0
 
     rows = _backup.read_log_rows()
@@ -371,19 +374,24 @@ def restore_logs_once(_backup):
                 cid = int(r[5])
             except ValueError:
                 cid = None
+            label = r[11] if len(r) > 11 else ""
+            if label == STATUS_DONE:
+                active, key = 0, "done"
+            elif label == STATUS_ABNORMAL:
+                active, key = 1, "abnormal"   # 하트비트 0 → 끊긴 세션
+            else:
+                active, key = 1, "running"    # 시트에 '시청 중'으로 남은 세션 → 곧 비정상 종료로 정정됨
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO watch_logs
                 (session_uuid, registration_number, name, email, course_id, course_title,
                  session_start_time, session_end_time, session_seconds,
-                 last_heartbeat, is_active, synced_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+                 last_heartbeat, is_active, synced_seconds, synced_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
-                (r[0], r[2], r[3], r[4], cid, r[6], r[7], r[8], sec, sec),
+                (r[0], r[2], r[3], r[4], cid, r[6], r[7], r[8], sec, active, sec, key),
             )
             restored += cur.rowcount
-    diag("Google Sheets 시청기록 복원 건수=%s", restored)
-    diag_elapsed("restore_logs_once", _diag_ts)
     return restored
 
 
@@ -391,11 +399,9 @@ def restore_logs_once(_backup):
 # 과목 설정
 # ==========================================================
 def ensure_courses(backup):
-    _diag_ts = time.time()
     """courses 테이블이 비어 있으면 시트에서 복원하고, 없으면 기본값으로 채웁니다."""
     with db() as conn:
         if conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0] > 0:
-            diag_elapsed("ensure_courses", _diag_ts)
             return True
 
     rows = []
@@ -421,7 +427,6 @@ def ensure_courses(backup):
             "(slot_id, title, video_url, target_minutes, enabled) VALUES (?, ?, ?, ?, ?)",
             rows,
         )
-    diag_elapsed("ensure_courses", _diag_ts)
     return True
 
 
@@ -589,7 +594,6 @@ def heartbeat_tick():
     ss.current_session_sec = int(now - ss.session_start_ts)
 
     if now - ss.last_db_save >= DB_SAVE_INTERVAL:
-        _diag_db_ts = time.time()
         user = ss.session_user
         if has_other_active_session(user["reg"], ss.session_uuid):
             finalize_session()
@@ -600,30 +604,108 @@ def heartbeat_tick():
             get_kst_now_str(), ss.current_session_sec, active=True,
         )
         ss.last_db_save = now
-        diag_elapsed("heartbeat DB 저장", _diag_db_ts)
 
 
 # ==========================================================
 # 명단 (구글 시트 CSV)
 # ==========================================================
-@st.cache_data(ttl=600, show_spinner=False)
-def get_users_from_google_sheet():
-    _diag_ts = time.time()
-    sheet_url = (
-        "https://docs.google.com/spreadsheets/d/"
-        "1kC87Ec4T2S0gGu28vI_Hzt5THhXuvZPK1P88hfeFEYI/export?format=csv&gid=0"
-    )
-    df = pd.read_csv(sheet_url, dtype=str).fillna("")  # 예외는 밖으로 → 실패 결과는 캐시되지 않음
-    df = df.rename(columns={
-        "등록번호": "registration_number",
-        "성명": "name",
-        "rsm 메일": "email",
-    })
-    df["registration_number"] = df["registration_number"].str.strip()
-    result = df[["registration_number", "name", "email"]]
-    diag("수강자 명단 조회 완료: rows=%s", len(result))
-    diag_elapsed("get_users_from_google_sheet", _diag_ts)
-    return result
+class RosterCache:
+    """
+    명단을 메모리에 보관합니다.
+    - 요청에는 제한 시간(timeout)이 있어 구글이 느려도 무한정 기다리지 않습니다.
+    - 갱신은 백그라운드에서 하므로, 갱신 중에도 접속자는 기존 명단을 즉시 받습니다.
+    - 갱신에 실패해도 마지막 정상 명단을 계속 사용합니다.
+    - 처음 한 번만 동기 로딩합니다.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.data = None          # (valid_users DataFrame, labels list)
+        self.loaded_at = 0.0
+        self.error = None
+        self.refreshing = False
+
+    @staticmethod
+    def _fetch():
+        r = requests.get(ROSTER_URL, timeout=ROSTER_TIMEOUT)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.content.decode("utf-8-sig")), dtype=str).fillna("")
+        df = df.rename(columns={
+            "등록번호": "registration_number",
+            "성명": "name",
+            "rsm 메일": "email",
+        })
+        df = df[["registration_number", "name", "email"]]
+        df["registration_number"] = df["registration_number"].str.strip()
+        valid = df[df["name"] != ""].reset_index(drop=True)
+        labels = [
+            f"{n} (등록번호: {rg}) - {em}"
+            for n, rg, em in zip(valid["name"], valid["registration_number"], valid["email"])
+        ]
+        return valid, labels
+
+    def _refresh(self):
+        t0 = time.time()
+        try:
+            data = self._fetch()
+            with self.lock:
+                self.data = data
+                self.loaded_at = time.time()
+                self.error = None
+            print(f"[perf] 명단 갱신 {time.time() - t0:.2f}s ({len(data[1])}명)", flush=True)
+        except Exception as e:
+            with self.lock:
+                self.error = str(e)
+                # 정상 명단이 있으면 1분 뒤 재시도, 없으면 다음 접속 때 바로 재시도
+                self.loaded_at = 0.0 if self.data is None else time.time() - ROSTER_TTL + 60
+            print(f"[perf] 명단 갱신 실패 {time.time() - t0:.2f}s: {e}", flush=True)
+        finally:
+            with self.lock:
+                self.refreshing = False
+
+    def refresh_now(self):
+        """관리자용: 지금 바로 명단을 다시 불러옵니다."""
+        with self.lock:
+            if self.refreshing:
+                return
+            self.refreshing = True
+        self._refresh()
+
+    def get(self):
+        with self.lock:
+            have = self.data is not None
+            start = (time.time() - self.loaded_at > ROSTER_TTL) and not self.refreshing
+            if start:
+                self.refreshing = True
+        if start:
+            if have:
+                threading.Thread(target=self._refresh, daemon=True, name="roster-refresh").start()
+            else:
+                self._refresh()   # 최초 1회만 직접 불러옴
+        elif not have:
+            # 다른 접속자가 최초 로딩 중이면 끝날 때까지 잠시 대기
+            for _ in range(int(ROSTER_TIMEOUT * 10) + 20):
+                time.sleep(0.1)
+                if self.data is not None or not self.refreshing:
+                    break
+        with self.lock:
+            data, err = self.data, self.error
+        if data is None:
+            return (pd.DataFrame(columns=["registration_number", "name", "email"]),
+                    [], err or "명단을 불러오지 못했습니다.")
+        return data[0], data[1], err
+
+
+@st.cache_resource
+def get_roster_cache():
+    return RosterCache()
+
+
+@st.cache_resource
+def init_once():
+    """DB 테이블 생성/보강은 서버 시작 후 1회만 수행합니다."""
+    init_db()
+    return True
 
 
 # ==========================================================
@@ -669,10 +751,9 @@ def render_backup_status(backup):
 # ==========================================================
 # ===== MAIN =====
 # ==========================================================
-_app_diag_started = time.time()
-diag('===== 앱 실행 시작 =====')
-init_db()
-diag_elapsed('init_db', _app_diag_started)
+_t_run = time.time()
+with timed("init_once"):
+    init_once()
 backup = get_backup()
 st.session_state["_backup_ref"] = backup
 
@@ -680,12 +761,15 @@ if backup is None:
     st.warning("⚠ 구글 시트 백업이 설정되지 않았습니다(secrets의 gcp_service_account, backup_sheet_url 확인). "
                "기록이 서버 DB에만 저장됩니다.")
 
-if not ensure_courses(backup):
+with timed("ensure_courses"):
+    _courses_ok = ensure_courses(backup)
+if not _courses_ok:
     st.stop()
 
 if backup is not None:
     try:
-        n_restored = restore_logs_once(backup)
+        with timed("restore_logs_once"):
+            n_restored = restore_logs_once(backup)
         if n_restored:
             st.toast(f"구글 시트에서 {n_restored}건의 시청 기록을 복원했습니다.", icon="♻️")
     except Exception as e:
@@ -708,24 +792,16 @@ st.caption("과목을 선택해 영상을 시청하세요. 과목별 목표 시�
 st.sidebar.header("👤 수강자 확인")
 
 current_user = None
-try:
-    users_df = get_users_from_google_sheet()
-    diag_elapsed("전체 초기 로딩", _app_diag_started)
-except Exception as e:
-    users_df = pd.DataFrame(columns=["registration_number", "name", "email"])
-    st.sidebar.error(f"명단을 불러오지 못했습니다: {e}")
-
-valid_users = users_df[users_df["name"] != ""].reset_index(drop=True)
+with timed("명단 로딩"):
+    valid_users, roster_labels, roster_err = get_roster_cache().get()
+if valid_users.empty:
+    st.sidebar.error(f"명단을 불러오지 못했습니다. 잠시 후 새로고침 해주세요: {roster_err}")
 
 if not valid_users.empty:
     idx = st.sidebar.selectbox(
         "본인의 이름을 검색하여 선택하세요 (오탈자 방지)",
-        options=[-1] + list(range(len(valid_users))),
-        format_func=lambda i: "선택하세요" if i == -1 else (
-            f"{valid_users.loc[i, 'name']} "
-            f"(등록번호: {valid_users.loc[i, 'registration_number']}) "
-            f"- {valid_users.loc[i, 'email']}"
-        ),
+        options=[-1] + list(range(len(roster_labels))),
+        format_func=lambda i: "선택하세요" if i == -1 else roster_labels[i],
     )
     if idx != -1:
         current_user = valid_users.loc[idx]
@@ -850,6 +926,12 @@ with st.sidebar.expander("⚙ 관리자 메뉴"):
             )
         else:
             st.info("아직 저장된 시청 기록이 없습니다.")
+
+        st.subheader("3. 수강자 명단")
+        st.caption("명단은 6시간마다 자동 갱신됩니다. 명단 시트를 고쳤다면 아래 버튼으로 바로 반영하세요.")
+        if st.button("명단 지금 새로고침"):
+            get_roster_cache().refresh_now()
+            st.rerun()
     elif admin_pw:
         st.error("비밀번호가 올바르지 않습니다.")
 
@@ -919,19 +1001,19 @@ else:
             finalize_session()
             st.rerun()
 
-    # ---- 타이머 + 대시보드 (이 부분만 매초 갱신) ----
-    @st.fragment(run_every=1 if ss.is_playing else None)
-    def live_panel():
+    # ---- 타이머 (가볍게: 진행바/숫자만 TICK_SECONDS마다 갱신) ----
+    @st.fragment(run_every=TICK_SECONDS if ss.is_playing else None)
+    def timer_panel():
         playing = bool(ss.is_playing and ss.session_start_ts)
         if playing:
             heartbeat_tick()
             cur = ss.session_course
             stats = ss.base_stats
-            live_cid, live_sec = cur["id"], ss.current_session_sec
+            live_sec = ss.current_session_sec
         else:
             cur = courses_by_id[selected_id]
             stats = get_course_stats(reg)
-            live_cid, live_sec = None, 0
+            live_sec = 0
 
         target = cur["target_min"] * 60
         total = stats.get(cur["id"], {}).get("sec", 0) + live_sec
@@ -948,8 +1030,20 @@ else:
                 st.success("🎉 이 과목의 필수 시청 시간을 모두 충족하여 이수가 완료되었습니다!")
             else:
                 st.info(f"목표 시간까지 **{fmt_sec(target - total)}** 남았습니다.")
-            render_backup_status(backup)
 
+    # ---- 대시보드 (표 렌더링은 무거우므로 DASHBOARD_REFRESH마다만 갱신) ----
+    @st.fragment(run_every=DASHBOARD_REFRESH if ss.is_playing else None)
+    def dashboard_panel():
+        playing = bool(ss.is_playing and ss.session_start_ts and ss.session_course)
+        if playing:
+            stats = ss.base_stats
+            live_cid = ss.session_course["id"]
+            live_sec = int(time.time() - ss.session_start_ts)
+        else:
+            stats = get_course_stats(reg)
+            live_cid, live_sec = None, 0
+
+        render_backup_status(backup)
         st.markdown("---")
         st.subheader(f"📊 [{current_user['name']} 님]의 과목별 이수 현황")
         dash = build_dashboard_df(enabled_courses, stats, live_cid, live_sec)
@@ -964,7 +1058,8 @@ else:
             },
         )
 
-    live_panel()
+    timer_panel()
+    dashboard_panel()
 
     # ---- 개인 시청 이력 ----
     st.markdown("---")
@@ -983,3 +1078,7 @@ else:
         st.caption("※ 진행 중인 세션은 '일시 정지 및 저장'을 누르면 이 표에 반영됩니다.")
     else:
         st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
+
+_elapsed = time.time() - _t_run
+if _elapsed >= 1.0:
+    print(f"[perf] 전체 스크립트 실행 {_elapsed:.2f}s", flush=True)
