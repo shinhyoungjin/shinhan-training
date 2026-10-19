@@ -785,7 +785,7 @@ ss = st.session_state
 courses = get_courses()
 courses_by_id = {c["id"]: c for c in courses}
 
-st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
+st.title("🎓 법인 임직원 자체 온라인 교육 (2차)")
 st.caption("과목을 선택해 영상을 시청하세요. 과목별 목표 시청시간을 채우면 자동으로 이수 처리됩니다.")
 
 # ---------------- 사이드바: 수강자 ----------------
