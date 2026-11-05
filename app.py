@@ -72,9 +72,34 @@ def fmt_sec(sec):
     return f"{sec // 60}분 {sec % 60}초"
 
 
+def parse_video_items(raw):
+    """
+    과목의 영상 칸을 [(url, 주제), ...]로 변환합니다.
+    한 줄에 영상 하나: "유튜브주소 | 주제"  (주제는 생략 가능)
+    """
+    items = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            url, title = line.split("|", 1)
+            if url.strip():
+                items.append((url.strip(), title.strip()))
+        else:
+            for u in re.split(r"[\s,]+", line):
+                if u:
+                    items.append((u, ""))
+    return items
+
+
 def parse_video_urls(raw):
-    """과목의 영상 URL 칸(여러 개면 줄바꿈/쉼표/| 로 구분)을 URL 목록으로 변환"""
-    return [u for u in re.split(r"[\s,|]+", raw or "") if u]
+    return [u for u, _ in parse_video_items(raw)]
+
+
+def serialize_video_items(raw):
+    """관리자 입력을 저장 형식으로 정리 (한 줄에 '주소 | 주제')"""
+    return "\n".join(f"{u} | {t}" if t else u for u, t in parse_video_items(raw))
 
 
 def youtube_id(url):
@@ -83,26 +108,31 @@ def youtube_id(url):
 
 
 def render_videos(raw):
-    """영상이 1개면 기본 플레이어, 2개 이상이면 하나의 플레이어에서 이어서 자동 재생"""
-    urls = parse_video_urls(raw)
-    ids = [youtube_id(u) for u in urls]
-    if len(urls) <= 1:
-        if urls:
-            st.video(urls[0])
+    """영상이 1개면 기본 플레이어, 2개 이상이면 하나의 플레이어에서 이어서 자동 재생 + 주제 표시"""
+    items = parse_video_items(raw)
+    if len(items) <= 1:
+        if items:
+            url, title = items[0]
+            if title:
+                st.markdown(f"**🎬 {title}**")
+            st.video(url)
         return
+    ids = [youtube_id(u) for u, _ in items]
     if any(i is None for i in ids):
         st.error("영상 URL 중 유튜브 주소를 인식하지 못한 것이 있습니다. 관리자에게 문의해 주세요.")
         return
+    titles = [t or f"영상 {n}" for n, (_, t) in enumerate(items, 1)]
     st.info(f"🎞 **총 {len(ids)}개 영상이 이어서 재생됩니다.**  첫 영상이 끝나면 다음 영상이 자동으로 시작됩니다.")
+    st.markdown("**📋 영상 구성**\n\n" + "\n".join(f"{n}. {tt}" for n, tt in enumerate(titles, 1)))
     html = """
+    <div id="info" style="font:bold 17px sans-serif;color:#1d4ed8;margin:0 auto 8px;max-width:960px;"></div>
     <div style="position:relative;width:100%;max-width:960px;margin:0 auto;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:#000;">
       <div id="player" style="position:absolute;inset:0;width:100%;height:100%;"></div>
     </div>
-    <div id="info" style="font:14px sans-serif;color:#555;margin:6px auto 0;max-width:960px;"></div>
     <script>
-      var IDS = __IDS__, idx = 0, player;
+      var IDS = __IDS__, TITLES = __TITLES__, idx = 0, player;
       function info(){ document.getElementById('info').textContent =
-        '재생 중: ' + (idx+1) + ' / ' + IDS.length + '번째 영상'; }
+        '▶ 지금 재생 중 (' + (idx+1) + '/' + IDS.length + '): ' + TITLES[idx]; }
       var tag = document.createElement('script');
       tag.src = 'https://www.youtube.com/iframe_api';
       document.head.appendChild(tag);
@@ -119,8 +149,8 @@ def render_videos(raw):
         info();
       }
     </script>
-    """.replace("__IDS__", json.dumps(ids))
-    components.html(html, height=600)
+    """.replace("__IDS__", json.dumps(ids)).replace("__TITLES__", json.dumps(titles, ensure_ascii=False))
+    components.html(html, height=620)
 
 
 @contextmanager
@@ -896,12 +926,12 @@ with st.sidebar.expander("⚙ 관리자 메뉴"):
                 en = st.checkbox("사용", value=c["enabled"], key=f"en_{c['id']}")
                 title = st.text_input("과목명", value=c["title"], key=f"ti_{c['id']}")
                 url = st.text_area(
-                    "유튜브 영상 URL (2개 이상이면 한 줄에 하나씩 → 이어서 재생)",
+                    "유튜브 영상 (한 줄에 하나씩: 주소 | 주제). 2개 이상이면 이어서 재생",
                     value=c["url"], key=f"ur_{c['id']}", height=90)
                 tgt = st.number_input("목표 시청시간(분)", value=c["target_min"],
                                       min_value=1, key=f"tg_{c['id']}")
                 new_rows.append((c["id"], title.strip() or f"과목 {c['id']}",
-                                 "\n".join(parse_video_urls(url)), int(tgt), 1 if en else 0))
+                                 serialize_video_items(url), int(tgt), 1 if en else 0))
                 st.markdown("---")
             submitted = st.form_submit_button("과목 설정 저장")
 
