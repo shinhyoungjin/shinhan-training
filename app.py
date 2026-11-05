@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials
 # 상수
 # ==========================================================
 DB_PATH = "training_data.db"
-NUM_COURSES = 3               # 과목(영상) 수
+NUM_COURSES = 4               # 과목(영상) 수
 DB_SAVE_INTERVAL = 5          # DB 자동저장(=하트비트) 주기(초)
 SHEET_SYNC_INTERVAL = 180     # 구글 시트 백업 주기(초) - 백업 목적이라 3분이면 충분
 MIN_BATCH_GAP = 30            # 백업 최소 간격(초) - 정지 버튼이 몰려도 이 간격 이상 유지(쿼터 보호)
@@ -402,6 +402,12 @@ def ensure_courses(backup):
     """courses 테이블이 비어 있으면 시트에서 복원하고, 없으면 기본값으로 채웁니다."""
     with db() as conn:
         if conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0] > 0:
+            # 과목 수를 늘린 경우: 기존 과목은 그대로 두고 빠진 슬롯만 빈 과목으로 추가
+            conn.executemany(
+                "INSERT OR IGNORE INTO courses "
+                "(slot_id, title, video_url, target_minutes, enabled) VALUES (?, ?, ?, ?, ?)",
+                [(i, f"과목 {i}", "", 50, 0) for i in range(1, NUM_COURSES + 1)],
+            )
             return True
 
     rows = []
@@ -785,7 +791,7 @@ ss = st.session_state
 courses = get_courses()
 courses_by_id = {c["id"]: c for c in courses}
 
-st.title("🎓 법인 임직원 법정의무/자체 온라인 교육")
+st.title("🎓 법인 임직원 자체 온라인 교육 (2차)")
 st.caption("과목을 선택해 영상을 시청하세요. 과목별 목표 시청시간을 채우면 자동으로 이수 처리됩니다.")
 
 # ---------------- 사이드바: 수강자 ----------------
