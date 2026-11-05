@@ -821,6 +821,8 @@ if not valid_users.empty:
         ss.selected_reg_num = None
 
 st.sidebar.markdown("---")
+course_box = st.sidebar.container()   # 과목 선택(아래 메인 영역에서 채움)
+st.sidebar.markdown("---")
 
 # ---------------- 사이드바: 관리자 ----------------
 with st.sidebar.expander("⚙ 관리자 메뉴"):
@@ -965,14 +967,17 @@ else:
     if ss.get("selected_course") not in enabled_ids:
         ss["selected_course"] = enabled_ids[0]
 
-    selected_id = st.radio(
-        "📚 시청할 과목을 선택하세요 (시청 중에는 변경할 수 없습니다)",
-        options=enabled_ids,
-        format_func=lambda i: f"{courses_by_id[i]['title']} ({courses_by_id[i]['target_min']}분)",
-        horizontal=True,
-        key="selected_course",
-        disabled=ss.is_playing,
-    )
+    with course_box:
+        st.header("📚 과목 선택")
+        selected_id = st.radio(
+            "시청할 과목을 선택하세요",
+            options=enabled_ids,
+            format_func=lambda i: f"{courses_by_id[i]['title']} ({courses_by_id[i]['target_min']}분)",
+            key="selected_course",
+            disabled=ss.is_playing,
+        )
+        if ss.is_playing:
+            st.caption("시청 중에는 과목을 바꿀 수 없습니다.")
 
     shown = ss.session_course if (ss.is_playing and ss.session_course) else courses_by_id[selected_id]
     st.subheader(f"📌 {shown['title']} (목표 시청시간: {shown['target_min']}분)")
@@ -1052,18 +1057,13 @@ else:
         target = cur["target_min"] * 60
         total = stats.get(cur["id"], {}).get("sec", 0) + live_sec
 
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.markdown(f"### ⏱️ {cur['title']}")
-            st.progress(min(total / target, 1.0))
-            st.metric("누적 시청 시간", f"{fmt_sec(total)} / {cur['target_min']}분")
-            st.caption("동일 계정으로는 한 번에 하나의 창에서만 시청 시간이 누적됩니다.")
-        with col2:
-            st.markdown("### 📝 이수 상태")
-            if total >= target:
-                st.success("🎉 이 과목의 필수 시청 시간을 모두 충족하여 이수가 완료되었습니다!")
-            else:
-                st.info(f"목표 시간까지 **{fmt_sec(target - total)}** 남았습니다.")
+        remain = max(target - total, 0)
+        st.progress(min(total / target, 1.0))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("누적 시청 시간", f"{fmt_sec(total)} / {cur['target_min']}분")
+        m2.metric("남은 시간", fmt_sec(remain))
+        m3.metric("이수 상태", "✅ 이수 완료" if total >= target else "⏳ 진행 중")
+        st.caption("동일 계정으로는 한 번에 하나의 창에서만 시청 시간이 누적됩니다.")
 
     # ---- 대시보드 (표 렌더링은 무거우므로 DASHBOARD_REFRESH마다만 갱신) ----
     @st.fragment(run_every=DASHBOARD_REFRESH if ss.is_playing else None)
@@ -1101,21 +1101,21 @@ else:
 
     # ---- 개인 시청 이력 ----
     st.markdown("---")
-    st.subheader(f"🗂 [{current_user['name']} 님]의 시청 이력")
-    user_logs_df = get_user_logs(reg)
-    if not user_logs_df.empty:
-        user_logs_df["과목"] = user_logs_df.apply(
-            lambda r: r["course_title"] or courses_by_id.get(r["course_id"], {}).get(
-                "title", f"과목 {r['course_id']}"), axis=1)
-        user_logs_df["시청 시간"] = user_logs_df["session_seconds"].apply(fmt_sec)
-        user_logs_df = user_logs_df.rename(columns={
-            "session_start_time": "시청 시작 시각 (KST)",
-            "session_end_time": "시청 종료/저장 시각 (KST)",
-        })[["과목", "시청 시작 시각 (KST)", "시청 종료/저장 시각 (KST)", "시청 시간"]]
-        st.dataframe(user_logs_df, hide_index=True)
-        st.caption("※ 진행 중인 세션은 '일시 정지 및 저장'을 누르면 이 표에 반영됩니다.")
-    else:
-        st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
+    with st.expander(f"🗂 [{current_user['name']} 님]의 시청 이력 보기"):
+        user_logs_df = get_user_logs(reg)
+        if not user_logs_df.empty:
+            user_logs_df["과목"] = user_logs_df.apply(
+                lambda r: r["course_title"] or courses_by_id.get(r["course_id"], {}).get(
+                    "title", f"과목 {r['course_id']}"), axis=1)
+            user_logs_df["시청 시간"] = user_logs_df["session_seconds"].apply(fmt_sec)
+            user_logs_df = user_logs_df.rename(columns={
+                "session_start_time": "시청 시작 시각 (KST)",
+                "session_end_time": "시청 종료/저장 시각 (KST)",
+            })[["과목", "시청 시작 시각 (KST)", "시청 종료/저장 시각 (KST)", "시청 시간"]]
+            st.dataframe(user_logs_df, hide_index=True)
+            st.caption("※ 진행 중인 세션은 '일시 정지 및 저장'을 누르면 이 표에 반영됩니다.")
+        else:
+            st.info("아직 저장된 시청 이력이 없습니다. 영상 시청을 시작하시면 기록이 생성됩니다.")
 
 _elapsed = time.time() - _t_run
 if _elapsed >= 1.0:
