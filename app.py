@@ -976,9 +976,13 @@ else:
 
     shown = ss.session_course if (ss.is_playing and ss.session_course) else courses_by_id[selected_id]
     st.subheader(f"📌 {shown['title']} (목표 시청시간: {shown['target_min']}분)")
-    st.video(shown["url"])
 
-    # ---- 시작/정지 버튼 (클릭 시 전체 재실행) ----
+    # ---- 시작/정지 버튼 (클릭 시 전체 재실행) : 영상 위쪽에 배치 ----
+    if not ss.is_playing:
+        st.warning("⚠ 아래 **'▶️ 영상 시청 시작 / 재개'** 버튼을 먼저 눌러야 시청 시간이 기록됩니다. "
+                   "(버튼을 누르지 않고 영상만 보면 기록되지 않습니다)")
+    else:
+        st.success("🔴 시청 기록 중입니다. 시청을 마치거나 쉬실 때는 '⏸️ 일시 정지 및 저장'을 눌러 주세요.")
     if not ss.is_playing:
         if st.button("▶️ 영상 시청 시작 / 재개"):
             course = courses_by_id[selected_id]
@@ -1065,6 +1069,10 @@ else:
         )
 
     timer_panel()
+
+    # ---- 영상 (버튼/이수상태/시청시간 아래) ----
+    st.video(shown["url"])
+
     dashboard_panel()
 
     # ---- 개인 시청 이력 ----
