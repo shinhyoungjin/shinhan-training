@@ -93,7 +93,7 @@ def render_videos(raw):
     if any(i is None for i in ids):
         st.error("영상 URL 중 유튜브 주소를 인식하지 못한 것이 있습니다. 관리자에게 문의해 주세요.")
         return
-    st.caption(f"🎞 총 {len(ids)}개 영상이 이어서 재생됩니다. (첫 영상이 끝나면 다음 영상이 자동으로 시작됩니다)")
+    st.info(f"🎞 **총 {len(ids)}개 영상이 이어서 재생됩니다.**  첫 영상이 끝나면 다음 영상이 자동으로 시작됩니다.")
     html = """
     <div style="position:relative;width:100%;max-width:960px;margin:0 auto;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:#000;">
       <div id="player" style="position:absolute;inset:0;width:100%;height:100%;"></div>
