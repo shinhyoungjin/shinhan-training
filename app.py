@@ -1,5 +1,6 @@
 import hmac
 import io
+import re
 import sqlite3
 import threading
 import time
@@ -12,6 +13,7 @@ import pandas as pd
 import pytz
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from google.oauth2.service_account import Credentials
 
 # ==========================================================
@@ -67,6 +69,37 @@ def fmt_epoch_kst(ts):
 def fmt_sec(sec):
     sec = int(sec)
     return f"{sec // 60}분 {sec % 60}초"
+
+
+def parse_video_urls(raw):
+    """과목의 영상 URL 칸(여러 개면 줄바꿈/쉼표/| 로 구분)을 URL 목록으로 변환"""
+    return [u for u in re.split(r"[\s,|]+", raw or "") if u]
+
+
+def youtube_id(url):
+    m = re.search(r"(?:v=|youtu\.be/|/embed/|/shorts/|/live/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def render_videos(raw):
+    """영상이 1개면 기본 플레이어, 2개 이상이면 하나의 플레이어에서 이어서 자동 재생"""
+    urls = parse_video_urls(raw)
+    ids = [youtube_id(u) for u in urls]
+    if len(urls) <= 1:
+        if urls:
+            st.video(urls[0])
+        return
+    if any(i is None for i in ids):
+        st.error("영상 URL 중 유튜브 주소를 인식하지 못한 것이 있습니다. 관리자에게 문의해 주세요.")
+        return
+    src = f"https://www.youtube.com/embed/{ids[0]}?playlist={','.join(ids[1:])}&rel=0"
+    st.caption(f"🎞 총 {len(ids)}개 영상이 이어서 재생됩니다. (첫 영상이 끝나면 다음 영상이 자동으로 시작됩니다)")
+    components.html(
+        f'<iframe width="100%" height="520" src="{src}" frameborder="0" '
+        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" '
+        f'allowfullscreen style="border-radius:8px;"></iframe>',
+        height=530,
+    )
 
 
 @contextmanager
@@ -841,11 +874,13 @@ with st.sidebar.expander("⚙ 관리자 메뉴"):
                 st.markdown(f"**과목 {c['id']}**")
                 en = st.checkbox("사용", value=c["enabled"], key=f"en_{c['id']}")
                 title = st.text_input("과목명", value=c["title"], key=f"ti_{c['id']}")
-                url = st.text_input("유튜브 영상 URL", value=c["url"], key=f"ur_{c['id']}")
+                url = st.text_area(
+                    "유튜브 영상 URL (2개 이상이면 한 줄에 하나씩 → 이어서 재생)",
+                    value=c["url"], key=f"ur_{c['id']}", height=90)
                 tgt = st.number_input("목표 시청시간(분)", value=c["target_min"],
                                       min_value=1, key=f"tg_{c['id']}")
                 new_rows.append((c["id"], title.strip() or f"과목 {c['id']}",
-                                 url.strip(), int(tgt), 1 if en else 0))
+                                 "\n".join(parse_video_urls(url)), int(tgt), 1 if en else 0))
                 st.markdown("---")
             submitted = st.form_submit_button("과목 설정 저장")
 
@@ -1095,7 +1130,7 @@ else:
     timer_panel()
 
     # ---- 영상 (버튼/이수상태/시청시간 아래) ----
-    st.video(shown["url"])
+    render_videos(shown["url"])
 
     dashboard_panel()
 
