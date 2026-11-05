@@ -1,5 +1,6 @@
 import hmac
 import io
+import json
 import re
 import sqlite3
 import threading
@@ -92,14 +93,34 @@ def render_videos(raw):
     if any(i is None for i in ids):
         st.error("영상 URL 중 유튜브 주소를 인식하지 못한 것이 있습니다. 관리자에게 문의해 주세요.")
         return
-    src = f"https://www.youtube.com/embed/{ids[0]}?playlist={','.join(ids[1:])}&rel=0"
     st.caption(f"🎞 총 {len(ids)}개 영상이 이어서 재생됩니다. (첫 영상이 끝나면 다음 영상이 자동으로 시작됩니다)")
-    components.html(
-        f'<iframe width="100%" height="520" src="{src}" frameborder="0" '
-        f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" '
-        f'allowfullscreen style="border-radius:8px;"></iframe>',
-        height=530,
-    )
+    html = """
+    <div style="position:relative;width:100%;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:#000;">
+      <div id="player" style="position:absolute;inset:0;width:100%;height:100%;"></div>
+    </div>
+    <div id="info" style="font:14px sans-serif;color:#555;margin-top:6px;"></div>
+    <script>
+      var IDS = __IDS__, idx = 0, player;
+      function info(){ document.getElementById('info').textContent =
+        '재생 중: ' + (idx+1) + ' / ' + IDS.length + '번째 영상'; }
+      var tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+      function onYouTubeIframeAPIReady(){
+        player = new YT.Player('player', {
+          width: '100%', height: '100%', videoId: IDS[0],
+          playerVars: {rel: 0, playsinline: 1},
+          events: {onStateChange: function(e){
+            if (e.data === YT.PlayerState.ENDED && idx < IDS.length - 1) {
+              idx += 1; player.loadVideoById(IDS[idx]); info();
+            }
+          }}
+        });
+        info();
+      }
+    </script>
+    """.replace("__IDS__", json.dumps(ids))
+    components.html(html, height=620)
 
 
 @contextmanager
