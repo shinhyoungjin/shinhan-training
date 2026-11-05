@@ -983,8 +983,30 @@ else:
                    "(버튼을 누르지 않고 영상만 보면 기록되지 않습니다)")
     else:
         st.success("🔴 시청 기록 중입니다. 시청을 마치거나 쉬실 때는 '⏸️ 일시 정지 및 저장'을 눌러 주세요.")
+    st.markdown("""
+    <style>
+    .st-key-startbtn button, .st-key-pausebtn button {
+        width: 100%; min-height: 4.2rem; border-radius: 12px; border: none;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.25);
+    }
+    .st-key-startbtn button p, .st-key-pausebtn button p {
+        font-size: 1.6rem !important; font-weight: 800 !important; color: #fff !important;
+    }
+    .st-key-startbtn button { background: #16a34a; animation: pulsebtn 1.6s infinite; }
+    .st-key-startbtn button:hover { background: #15803d; }
+    .st-key-pausebtn button { background: #ea580c; }
+    .st-key-pausebtn button:hover { background: #c2410c; }
+    @keyframes pulsebtn {
+        0%   { box-shadow: 0 0 0 0 rgba(22,163,74,0.6); }
+        70%  { box-shadow: 0 0 0 16px rgba(22,163,74,0); }
+        100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); }
+    }
+    </style>
+    """, unsafe_allow_html=True)
     if not ss.is_playing:
-        if st.button("▶️ 영상 시청 시작 / 재개"):
+        with st.container(key="startbtn"):
+            start_clicked = st.button("▶️ 영상 시청 시작 / 재개", use_container_width=True)
+        if start_clicked:
             course = courses_by_id[selected_id]
             new_uuid = uuid.uuid4().hex
             start_str = get_kst_now_str()
@@ -1007,7 +1029,9 @@ else:
                     f"해당 창에서 '일시 정지'를 누르거나, 창을 닫은 뒤 약 {HEARTBEAT_TIMEOUT}초 후 다시 시도하세요."
                 )
     else:
-        if st.button("⏸️ 일시 정지 및 저장"):
+        with st.container(key="pausebtn"):
+            pause_clicked = st.button("⏸️ 일시 정지 및 저장", use_container_width=True)
+        if pause_clicked:
             finalize_session()
             st.rerun()
 
